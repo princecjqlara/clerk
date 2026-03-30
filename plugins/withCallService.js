@@ -212,6 +212,12 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
+import android.os.Build
+import androidx.core.app.NotificationCompat
 import ${packageName}.module.AICallModule
 
 class AIInCallService : InCallService() {
@@ -256,6 +262,10 @@ class AIInCallService : InCallService() {
                         "callId" to callId,
                         "duration" to duration.toString()
                     ))
+
+                    // Show notification that call was handled
+                    showCallCompletedNotification(phoneNumber, duration)
+
                     currentCall = null
                     callStartTime = 0
                 }
@@ -334,6 +344,43 @@ class AIInCallService : InCallService() {
         instance = this
     }
 
+    private fun showCallCompletedNotification(phoneNumber: String, duration: Int) {
+        try {
+            val channelId = "ai_call_completed"
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            // Create notification channel (required for Android 8+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    channelId,
+                    "AI Call Completed",
+                    NotificationManager.IMPORTANCE_DEFAULT
+                ).apply {
+                    description = "Notifications when AI receptionist completes a call"
+                }
+                notificationManager.createNotificationChannel(channel)
+            }
+
+            val minutes = duration / 60
+            val seconds = duration % 60
+            val durationText = String.format("%d:%02d", minutes, seconds)
+
+            val notification = NotificationCompat.Builder(this, channelId)
+                .setSmallIcon(android.R.drawable.ic_menu_call)
+                .setContentTitle("AI Call Completed")
+                .setContentText("Call from $phoneNumber handled by AI ($durationText)")
+                .setStyle(NotificationCompat.BigTextStyle()
+                    .bigText("Call from $phoneNumber was answered and handled by your AI receptionist.\\nDuration: $durationText\\nTap to view details."))
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setAutoCancel(true)
+                .build()
+
+            notificationManager.notify(System.currentTimeMillis().toInt(), notification)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to show notification: \${e.message}")
+        }
+    }
+
     override fun onDestroy() {
         stopAIConversation()
         instance = null
@@ -384,15 +431,25 @@ class AudioBridge(
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val PROXY_BASE = "http://10.0.2.2:3456" // localhost from Android emulator
-        private const val SILENCE_THRESHOLD_RMS = 500.0  // RMS below this = silence
-        private const val SILENCE_DURATION_MS = 1500L    // 1.5s of silence triggers transcription
-        private const val MIN_SPEECH_DURATION_MS = 500L  // Minimum speech before we consider it valid
-        private const val MAX_RECORD_DURATION_MS = 30000L // Max 30s recording per turn
+        private const val SILENCE_THRESHOLD_RMS = 500.0
+        private const val SILENCE_DURATION_MS = 1500L
+        private const val MIN_SPEECH_DURATION_MS = 500L
+        private const val MAX_RECORD_DURATION_MS = 30000L
 
-        // Set this to the real device IP if not using emulator
-        // For real device testing, use the machine's local network IP
-        var proxyBaseUrl: String = PROXY_BASE
+        // Direct API endpoints — no proxy needed
+        private const val DEEPGRAM_STT_URL = "https://api.deepgram.com/v1/listen?model=nova-3&language=tl&punctuate=true&smart_format=true&numerals=true"
+        private const val ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/"
+        private const val NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+        // API keys — loaded from SharedPreferences (set by tenant config)
+        var deepgramApiKey: String = "7288b46b415eda427fab877bfd25ce6299bd5f6e"
+        var elevenLabsApiKey: String = "sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b"
+        var nvidiaApiKey: String = "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"
+        var elevenLabsVoiceId: String = "EXAVITQu4vr4xnSDxMaL"
+        var aiModel: String = "meta/llama-3.3-70b-instruct"
+
+        // Legacy — kept for backward compat but not used for API calls
+        var proxyBaseUrl: String = "http://10.0.2.2:3456"
     }
 
     // State
@@ -574,29 +631,18 @@ class AudioBridge(
     // ===================== WELCOME MESSAGE =====================
 
     private fun playWelcomeAudio(): Boolean {
+        // Generate welcome greeting directly via ElevenLabs
         try {
-            val url = URL("$proxyBaseUrl/api/welcome/default")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 5000
-            conn.readTimeout = 10000
-
-            if (conn.responseCode != 200) {
-                conn.disconnect()
-                return false
+            val welcomeText = "Hello po! Salamat sa pag-tawag. Paano ko po kayo matutulungan ngayon?"
+            val audioBytes = fetchElevenLabsTTS(welcomeText)
+            if (audioBytes != null && audioBytes.isNotEmpty()) {
+                playAudioToCall(audioBytes)
+                return true
             }
-
-            val audioBytes = conn.inputStream.readBytes()
-            conn.disconnect()
-
-            if (audioBytes.isEmpty()) return false
-
-            playAudioToCall(audioBytes)
-            return true
         } catch (e: Exception) {
-            Log.w(TAG, "Welcome audio not available: \${e.message}")
-            return false
+            Log.w(TAG, "Welcome TTS failed: \${e.message}")
         }
+        return false
     }
 
     // ===================== VOICE RECORDING =====================
@@ -736,11 +782,13 @@ class AudioBridge(
             // Build WAV from raw PCM
             val wavData = buildWav(audioData, SAMPLE_RATE, 1, 16)
 
-            val url = URL("$proxyBaseUrl/api/stt")
+            // Call Deepgram directly
+            val url = URL(DEEPGRAM_STT_URL)
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "audio/wav")
+            conn.setRequestProperty("Authorization", "Token $deepgramApiKey")
             conn.connectTimeout = 10000
             conn.readTimeout = 30000
 
@@ -748,7 +796,7 @@ class AudioBridge(
 
             if (conn.responseCode != 200) {
                 val errorBody = try { conn.errorStream?.bufferedReader()?.readText() } catch (e: Exception) { "unknown" }
-                Log.e(TAG, "STT failed: \${conn.responseCode} - $errorBody")
+                Log.e(TAG, "Deepgram STT failed: \${conn.responseCode} - $errorBody")
                 conn.disconnect()
                 return null
             }
@@ -756,9 +804,17 @@ class AudioBridge(
             val responseBody = conn.inputStream.bufferedReader().readText()
             conn.disconnect()
 
-            // Parse JSON response: { "transcript": "...", "detectedLang": "..." }
+            // Parse Deepgram response
             val jsonResponse = org.json.JSONObject(responseBody)
-            val transcript = jsonResponse.optString("transcript", "")
+            val transcript = jsonResponse
+                .optJSONObject("results")
+                ?.optJSONArray("channels")
+                ?.optJSONObject(0)
+                ?.optJSONArray("alternatives")
+                ?.optJSONObject(0)
+                ?.optString("transcript", "") ?: ""
+
+            Log.d(TAG, "Deepgram transcript: $transcript")
             return transcript.takeIf { it.isNotBlank() }
         } catch (e: Exception) {
             Log.e(TAG, "STT error", e)
@@ -818,11 +874,7 @@ class AudioBridge(
 
     private fun playTTSResponse(text: String): Boolean {
         try {
-            // Try ElevenLabs first, fall back to Edge TTS
-            var audioBytes = fetchTTSAudio("$proxyBaseUrl/api/elevenlabs/tts", text)
-            if (audioBytes == null) {
-                audioBytes = fetchTTSAudio("$proxyBaseUrl/api/tts", text)
-            }
+            val audioBytes = fetchElevenLabsTTS(text)
 
             if (audioBytes == null || audioBytes.isEmpty()) {
                 Log.w(TAG, "No TTS audio received")
@@ -837,38 +889,44 @@ class AudioBridge(
         }
     }
 
-    private fun fetchTTSAudio(endpoint: String, text: String): ByteArray? {
+    private fun fetchElevenLabsTTS(text: String): ByteArray? {
         try {
-            val url = URL(endpoint)
+            // Call ElevenLabs API directly
+            val url = URL("$ELEVENLABS_TTS_URL$elevenLabsVoiceId")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("xi-api-key", elevenLabsApiKey)
+            conn.setRequestProperty("Accept", "audio/mpeg")
             conn.connectTimeout = 10000
             conn.readTimeout = 30000
 
             val json = org.json.JSONObject()
             json.put("text", text)
-            if (endpoint.contains("elevenlabs")) {
-                json.put("voice_id", "EXAVITQu4vr4xnSDxMaL")
-                json.put("model_id", "eleven_multilingual_v2")
-            } else {
-                json.put("voice", "fil-PH-BlessicaNeural")
-            }
-            val body = json.toString()
+            json.put("model_id", "eleven_multilingual_v2")
+            val voiceSettings = org.json.JSONObject()
+            voiceSettings.put("stability", 0.5)
+            voiceSettings.put("similarity_boost", 0.75)
+            voiceSettings.put("style", 0.3)
+            voiceSettings.put("use_speaker_boost", true)
+            json.put("voice_settings", voiceSettings)
 
-            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            conn.outputStream.use { it.write(json.toString().toByteArray(Charsets.UTF_8)) }
 
             if (conn.responseCode != 200) {
+                val errorBody = try { conn.errorStream?.bufferedReader()?.readText() } catch (e: Exception) { "unknown" }
+                Log.w(TAG, "ElevenLabs TTS failed: \${conn.responseCode} - $errorBody")
                 conn.disconnect()
                 return null
             }
 
             val audioBytes = conn.inputStream.readBytes()
             conn.disconnect()
+            Log.d(TAG, "ElevenLabs TTS received \${audioBytes.size} bytes")
             return audioBytes
         } catch (e: Exception) {
-            Log.w(TAG, "TTS fetch failed from $endpoint: \${e.message}")
+            Log.w(TAG, "ElevenLabs TTS error: \${e.message}")
             return null
         }
     }
@@ -1196,6 +1254,23 @@ class AICallModule(private val ctx: ReactApplicationContext) :
     @ReactMethod
     fun setProxyBaseUrl(url: String, promise: Promise) {
         AudioBridge.proxyBaseUrl = url
+        promise.resolve(true)
+    }
+
+    @ReactMethod
+    fun setApiKeys(deepgramKey: String, elevenLabsKey: String, nvidiaKey: String, promise: Promise) {
+        if (deepgramKey.isNotBlank()) AudioBridge.deepgramApiKey = deepgramKey
+        if (elevenLabsKey.isNotBlank()) AudioBridge.elevenLabsApiKey = elevenLabsKey
+        if (nvidiaKey.isNotBlank()) AudioBridge.nvidiaApiKey = nvidiaKey
+        Log.d(TAG, "API keys updated")
+        promise.resolve(true)
+    }
+
+    @ReactMethod
+    fun setVoiceConfig(voiceId: String, model: String, promise: Promise) {
+        if (voiceId.isNotBlank()) AudioBridge.elevenLabsVoiceId = voiceId
+        if (model.isNotBlank()) AudioBridge.aiModel = model
+        Log.d(TAG, "Voice config updated: voice=$voiceId model=$model")
         promise.resolve(true)
     }
 

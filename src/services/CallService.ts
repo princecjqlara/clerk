@@ -187,6 +187,18 @@ class CallService {
     }
   }
 
+  async setApiKeys(deepgramKey: string, elevenLabsKey: string, nvidiaKey: string): Promise<void> {
+    if (AICallModule?.setApiKeys) {
+      await AICallModule.setApiKeys(deepgramKey, elevenLabsKey, nvidiaKey);
+    }
+  }
+
+  async setVoiceConfig(voiceId: string, model: string): Promise<void> {
+    if (AICallModule?.setVoiceConfig) {
+      await AICallModule.setVoiceConfig(voiceId, model);
+    }
+  }
+
   destroy() {
     this.emitter?.removeAllListeners('onIncomingCall');
     this.emitter?.removeAllListeners('onCallAnswered');
