@@ -1,9 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import {
-  View, Text, TextInput, StyleSheet, ScrollView, TouchableOpacity, Alert, ActivityIndicator, Modal,
+  View, Text, TextInput, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Modal, Platform,
 } from 'react-native';
 import { getAllTenants, createTenant, updateTenant, toggleTenantActive, deleteTenant, type Tenant } from '../services/AdminService';
 import { supabaseAdmin } from '../services/SupabaseClient';
+
+// Alert that works on web too
+const alert = (title: string, message?: string) => {
+  if (Platform.OS === 'web') {
+    window.alert(message ? `${title}: ${message}` : title);
+  } else {
+    const { Alert } = require('react-native');
+    alert(title, message);
+  }
+};
 
 interface Props {
   onBack: () => void;
@@ -27,7 +37,7 @@ export default function AdminTenantsScreen({ onBack }: Props) {
       const data = await getAllTenants();
       setTenants(data);
     } catch (err: any) {
-      Alert.alert('Error', err.message);
+      alert('Error', err.message);
     }
     setLoading(false);
   };
@@ -66,7 +76,7 @@ export default function AdminTenantsScreen({ onBack }: Props) {
   const addElKey = () => {
     if (!newElKey.trim()) return;
     if (form.elevenlabs_keys.some(k => k.apiKey === newElKey.trim())) {
-      Alert.alert('Duplicate', 'This key already exists');
+      alert('Duplicate', 'This key already exists');
       return;
     }
     setForm({
@@ -113,7 +123,7 @@ export default function AdminTenantsScreen({ onBack }: Props) {
   };
 
   const handleSave = async () => {
-    if (!form.name.trim()) { Alert.alert('Error', 'Name is required'); return; }
+    if (!form.name.trim()) { alert('Error', 'Name is required'); return; }
     try {
       if (editTenant) {
         await updateTenant(editTenant.id, {
@@ -127,11 +137,11 @@ export default function AdminTenantsScreen({ onBack }: Props) {
       } else {
         // Validate email/password for new tenants
         if (!form.email.trim() || !form.password.trim()) {
-          Alert.alert('Error', 'Email and password are required for new tenants');
+          alert('Error', 'Email and password are required for new tenants');
           return;
         }
         if (form.password.length < 6) {
-          Alert.alert('Error', 'Password must be at least 6 characters');
+          alert('Error', 'Password must be at least 6 characters');
           return;
         }
 
@@ -170,32 +180,34 @@ export default function AdminTenantsScreen({ onBack }: Props) {
           });
         }
 
-        Alert.alert('Success', `Tenant created!\n\nLogin: ${form.email.trim()}\nPassword: ${form.password}`);
+        alert('Success', `Tenant created!\n\nLogin: ${form.email.trim()}\nPassword: ${form.password}`);
       }
 
-      // Sync ElevenLabs keys to proxy server
+      // Sync ElevenLabs keys to proxy server (non-blocking, may not be running)
       if (form.elevenlabs_keys.length > 0) {
-        await syncElevenLabsKeys(form.elevenlabs_keys);
+        syncElevenLabsKeys(form.elevenlabs_keys).catch(() => {});
       }
 
       setShowModal(false);
       setLoading(true);
       loadTenants();
     } catch (err: any) {
-      Alert.alert('Error', err.message);
+      alert('Error', err.message);
+      console.error('Save tenant error:', err);
     }
   };
 
   const handleDelete = async (t: Tenant) => {
-    Alert.alert('Delete Tenant', `Delete "${t.name}"? This cannot be undone.`, [
-      { text: 'Cancel' },
-      { text: 'Delete', style: 'destructive', onPress: async () => {
-        try {
-          await deleteTenant(t.id);
-          setTenants(tenants.filter(x => x.id !== t.id));
-        } catch (err: any) { Alert.alert('Error', err.message); }
-      }},
-    ]);
+    const confirmed = Platform.OS === 'web'
+      ? window.confirm(`Delete "${t.name}"? This cannot be undone.`)
+      : true; // On native, Alert with buttons handles this
+    if (!confirmed) return;
+    try {
+      await deleteTenant(t.id);
+      setTenants(tenants.filter(x => x.id !== t.id));
+    } catch (err: any) {
+      alert('Error', err.message);
+    }
   };
 
   return (

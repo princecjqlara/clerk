@@ -67,13 +67,40 @@ export async function createTenant(tenant: {
   max_users?: number;
   custom_instructions?: string;
   business_phone?: string;
+  elevenlabs_keys?: any;
 }): Promise<Tenant> {
+  // Only include fields that exist in the DB — skip elevenlabs_keys if column doesn't exist
+  const insertData: any = {
+    name: tenant.name,
+    owner_id: tenant.owner_id,
+    nvidia_api_key: tenant.nvidia_api_key || '',
+    max_users: tenant.max_users || 5,
+    custom_instructions: tenant.custom_instructions || '',
+    business_phone: tenant.business_phone || '',
+  };
+  if (tenant.elevenlabs_keys) {
+    insertData.elevenlabs_keys = tenant.elevenlabs_keys;
+  }
+
   const { data, error } = await supabaseAdmin
     .from('tenants')
-    .insert(tenant)
+    .insert(insertData)
     .select()
     .single();
-  if (error) throw error;
+  if (error) {
+    // If elevenlabs_keys column doesn't exist, retry without it
+    if (error.message?.includes('elevenlabs_keys')) {
+      delete insertData.elevenlabs_keys;
+      const { data: d2, error: e2 } = await supabaseAdmin
+        .from('tenants')
+        .insert(insertData)
+        .select()
+        .single();
+      if (e2) throw e2;
+      return d2;
+    }
+    throw error;
+  }
   return data;
 }
 
