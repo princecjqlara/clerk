@@ -44,16 +44,13 @@ export default function App() {
     init();
 
     const { data: { subscription } } = onAuthStateChange(async (session) => {
-      // Skip the initial fire — we already handled it above
       if (!initialized) return;
-      if (session) {
-        const p = await getCurrentProfile();
-        setProfile(p);
-        setScreen(p?.role === 'admin' ? 'admin-dashboard' : 'tenant-dashboard');
-      } else {
+      // Only redirect on actual login/logout — not on tab switch
+      if (!session) {
         setProfile(null);
         setScreen('login');
       }
+      // Don't reset screen on session refresh — user stays where they are
     });
     return () => subscription.unsubscribe();
   }, []);
