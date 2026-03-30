@@ -35,7 +35,8 @@
       "Bash(REACT_NATIVE_PACKAGER_HOSTNAME=192.168.110.239 npx expo start --port 8081)",
       "Bash(netsh advfirewall:*)",
       "Bash(npx vercel:*)",
-      "Bash(vercel --prod --yes)"
+      "Bash(vercel --prod --yes)",
+      "Bash(./gradlew assembleRelease)"
     ]
   }
 }
