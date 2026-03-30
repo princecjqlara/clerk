@@ -131,6 +131,20 @@ class CallService {
     return false;
   }
 
+  async checkPermissions(): Promise<boolean> {
+    if (AICallModule?.checkPermissions) {
+      return AICallModule.checkPermissions();
+    }
+    return false;
+  }
+
+  async checkDefaultDialer(): Promise<boolean> {
+    if (AICallModule?.checkDefaultDialer) {
+      return AICallModule.checkDefaultDialer();
+    }
+    return false;
+  }
+
   async requestPermissions(): Promise<boolean> {
     if (AICallModule) {
       return AICallModule.requestPermissions();

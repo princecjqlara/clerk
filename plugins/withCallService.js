@@ -1277,6 +1277,34 @@ class AICallModule(private val ctx: ReactApplicationContext) :
     // ==================== Permissions ====================
 
     @ReactMethod
+    fun checkPermissions(promise: Promise) {
+        val activity = ctx.currentActivity
+        if (activity == null) {
+            promise.resolve(false)
+            return
+        }
+        val permissions = arrayOf(
+            Manifest.permission.ANSWER_PHONE_CALLS,
+            Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.RECORD_AUDIO,
+        )
+        val allGranted = permissions.all {
+            ContextCompat.checkSelfPermission(activity, it) == PackageManager.PERMISSION_GRANTED
+        }
+        promise.resolve(allGranted)
+    }
+
+    @ReactMethod
+    fun checkDefaultDialer(promise: Promise) {
+        try {
+            val telecomManager = ctx.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            promise.resolve(telecomManager.defaultDialerPackage == ctx.packageName)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
     fun requestPermissions(promise: Promise) {
         val activity = ctx.currentActivity
         if (activity == null) {

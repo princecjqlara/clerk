@@ -36,7 +36,8 @@
       "Bash(netsh advfirewall:*)",
       "Bash(npx vercel:*)",
       "Bash(vercel --prod --yes)",
-      "Bash(./gradlew assembleRelease)"
+      "Bash(./gradlew assembleRelease)",
+      "Bash(cd:*)"
     ]
   }
 }

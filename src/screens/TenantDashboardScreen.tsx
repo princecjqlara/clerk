@@ -37,6 +37,9 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
 
   useEffect(() => {
     Storage.getEnabled().then(setAiEnabled).catch(() => {});
+    // Auto-check permissions on load
+    callService.checkPermissions().then(setPermsGranted).catch(() => {});
+    callService.checkDefaultDialer().then(setDialerSet).catch(() => {});
   }, []);
 
   const toggleAI = async (value: boolean) => {
