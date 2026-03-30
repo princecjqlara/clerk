@@ -1,9 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import {
-  View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Modal, RefreshControl,
+  View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Modal, RefreshControl, Platform, Switch, Alert,
 } from 'react-native';
 import { supabaseAdmin } from '../services/SupabaseClient';
 import { signOut, getCurrentProfile } from '../services/AuthService';
+import { callService } from '../services/CallService';
+import * as Storage from '../services/StorageService';
 
 interface CallLogEntry {
   id: string;
@@ -28,6 +30,45 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
   const [tenantName, setTenantName] = useState('');
   const [selectedCall, setSelectedCall] = useState<CallLogEntry | null>(null);
   const [stats, setStats] = useState({ total: 0, completed: 0, missed: 0 });
+  const [aiEnabled, setAiEnabled] = useState(false);
+  const [permsGranted, setPermsGranted] = useState(false);
+  const [dialerSet, setDialerSet] = useState(false);
+  const [keysSet, setKeysSet] = useState(false);
+
+  useEffect(() => {
+    Storage.getEnabled().then(setAiEnabled).catch(() => {});
+  }, []);
+
+  const toggleAI = async (value: boolean) => {
+    await Storage.setEnabled(value);
+    await callService.setEnabled(value);
+    setAiEnabled(value);
+  };
+
+  const requestPerms = async () => {
+    try {
+      const granted = await callService.requestPermissions();
+      setPermsGranted(granted);
+    } catch {}
+  };
+
+  const requestDialer = async () => {
+    try {
+      await callService.requestDefaultDialer();
+      setDialerSet(true);
+    } catch {}
+  };
+
+  const configureKeys = async () => {
+    try {
+      await callService.setApiKeys(
+        '7288b46b415eda427fab877bfd25ce6299bd5f6e',
+        'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b',
+        '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'
+      );
+      setKeysSet(true);
+    } catch {}
+  };
 
   const loadData = async () => {
     try {
@@ -157,6 +198,61 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
             <Text style={[styles.statValue, { color: '#ff9800' }]}>{stats.missed}</Text>
             <Text style={styles.statLabel}>Missed</Text>
           </View>
+        </View>
+
+        {/* AI Receptionist Toggle + Setup */}
+        <View style={styles.aiCard}>
+          <View style={styles.aiCardRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.aiCardTitle}>AI Receptionist</Text>
+              <Text style={[styles.aiCardStatus, { color: aiEnabled ? '#76b900' : '#888' }]}>
+                {aiEnabled ? 'Active — Answering Calls' : 'Disabled'}
+              </Text>
+            </View>
+            <Switch
+              value={aiEnabled}
+              onValueChange={toggleAI}
+              trackColor={{ false: '#555', true: '#4CAF50' }}
+              thumbColor={aiEnabled ? '#fff' : '#ccc'}
+            />
+          </View>
+
+          {!aiEnabled && (
+            <View style={{ marginTop: 12 }}>
+              <Text style={styles.setupLabel}>Setup</Text>
+
+              <TouchableOpacity
+                style={[styles.setupBtn, permsGranted && styles.setupBtnDone]}
+                onPress={requestPerms}
+              >
+                <Text style={styles.setupBtnText}>
+                  {permsGranted ? '\u2713  Permissions Granted' : '1. Grant Phone & Mic Permissions'}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.setupBtn, dialerSet && styles.setupBtnDone]}
+                onPress={requestDialer}
+              >
+                <Text style={styles.setupBtnText}>
+                  {dialerSet ? '\u2713  Default Dialer Set' : '2. Set as Default Phone App'}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.setupBtn, keysSet && styles.setupBtnDone]}
+                onPress={configureKeys}
+              >
+                <Text style={styles.setupBtnText}>
+                  {keysSet ? '\u2713  API Keys Configured' : '3. Configure API Keys'}
+                </Text>
+              </TouchableOpacity>
+
+              {permsGranted && dialerSet && keysSet && (
+                <Text style={styles.setupReady}>All set! Enable the toggle above to start.</Text>
+              )}
+            </View>
+          )}
         </View>
 
         {/* Quick Actions */}
@@ -315,6 +411,22 @@ function Field({ label, value, highlight }: { label: string; value: string; high
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0a0a0a' },
+  // AI Card + Setup
+  aiCard: {
+    marginHorizontal: 16, borderRadius: 16, padding: 16, marginBottom: 16,
+    backgroundColor: '#1a1a1a', borderWidth: 1, borderColor: '#333',
+  },
+  aiCardRow: { flexDirection: 'row', alignItems: 'center' },
+  aiCardTitle: { fontSize: 16, fontWeight: '700', color: '#fff' },
+  aiCardStatus: { fontSize: 13, marginTop: 2 },
+  setupLabel: { fontSize: 12, fontWeight: '600', color: '#888', marginBottom: 8, textTransform: 'uppercase' },
+  setupBtn: {
+    backgroundColor: '#111', borderRadius: 10, padding: 14, marginBottom: 8,
+    borderWidth: 1, borderColor: '#333',
+  },
+  setupBtnDone: { borderColor: '#76b900', backgroundColor: '#0a1a0a' },
+  setupBtnText: { color: '#ccc', fontSize: 14, fontWeight: '500' },
+  setupReady: { color: '#76b900', fontSize: 13, fontWeight: '600', textAlign: 'center', marginTop: 8 },
   loadingContainer: { flex: 1, backgroundColor: '#0a0a0a', justifyContent: 'center', alignItems: 'center' },
   header: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
