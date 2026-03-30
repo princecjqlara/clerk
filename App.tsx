@@ -23,8 +23,29 @@ export default function App() {
   const homeScreen = () => profile?.role === 'admin' ? 'admin-dashboard' : 'tenant-dashboard';
 
   useEffect(() => {
-    checkAuth();
+    let initialized = false;
+
+    const init = async () => {
+      try {
+        const session = await getSession();
+        if (session) {
+          const p = await getCurrentProfile();
+          setProfile(p);
+          setScreen(p?.role === 'admin' ? 'admin-dashboard' : 'tenant-dashboard');
+        } else {
+          setScreen('login');
+        }
+      } catch {
+        setScreen('login');
+      }
+      initialized = true;
+    };
+
+    init();
+
     const { data: { subscription } } = onAuthStateChange(async (session) => {
+      // Skip the initial fire — we already handled it above
+      if (!initialized) return;
       if (session) {
         const p = await getCurrentProfile();
         setProfile(p);
@@ -36,21 +57,6 @@ export default function App() {
     });
     return () => subscription.unsubscribe();
   }, []);
-
-  const checkAuth = async () => {
-    try {
-      const session = await getSession();
-      if (session) {
-        const p = await getCurrentProfile();
-        setProfile(p);
-        setScreen(p?.role === 'admin' ? 'admin-dashboard' : 'tenant-dashboard');
-      } else {
-        setScreen('login');
-      }
-    } catch {
-      setScreen('login');
-    }
-  };
 
   const handleLogin = async () => {
     const p = await getCurrentProfile();
