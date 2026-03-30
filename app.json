@@ -40,7 +40,8 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "./plugins/withCallService"
+      "./plugins/withCallService",
+      "expo-secure-store"
     ]
   }
 }

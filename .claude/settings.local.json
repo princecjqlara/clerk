@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Preview__preview_start",
+      "Bash(npx expo:*)",
+      "Bash(npm install:*)",
+      "Bash(netstat -ano)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(python -m pip install edge-tts)",
+      "Bash(taskkill //F //FI 'WINDOWTITLE eq node')",
+      "Bash(curl -s -X POST http://localhost:3456/api/tts -H \"Content-Type: application/json\" -d '{\"\"text\"\": \"\"Hello po! Salamat sa pag-tawag. Paano ko po kayo matutulungan?\"\", \"\"voice\"\": \"\"fil-PH-BlessicaNeural\"\"}' --output /tmp/test-tts.mp3 -w \"\\\\nHTTP %{http_code}, size: %{size_download} bytes\")",
+      "Bash(python -m edge_tts --list-voices)",
+      "Bash(curl -s -X POST \"https://api.deepgram.com/v1/listen?model=nova-2&language=fil&punctuate=true\" -H \"Authorization: Token 7288b46b415eda427fab877bfd25ce6299bd5f6e\" -H \"Content-Type: application/json\" -d '{\"\"\"\"url\"\"\"\":\"\"\"\"https://static.deepgram.com/examples/Bueller-Life-moves-pretty-fast.wav\"\"\"\"}')",
+      "Bash(curl -s \"https://api.deepgram.com/v1/projects\" -H \"Authorization: Token 7288b46b415eda427fab877bfd25ce6299bd5f6e\")",
+      "Bash(python -m json.tool)",
+      "Bash(curl -s -o /tmp/bueller.wav \"https://static.deepgram.com/examples/Bueller-Life-moves-pretty-fast.wav\")",
+      "Bash(curl -s -X POST \"http://localhost:3456/api/stt\" -H \"Content-Type: audio/wav\" --data-binary @/tmp/bueller.wav)",
+      "WebSearch",
+      "WebFetch(domain:build.nvidia.com)",
+      "Bash(node:*)",
+      "Bash(taskkill:*)",
+      "Bash(curl:*)",
+      "Bash(printf '{\"\"\"\"test\"\"\"\":true}')",
+      "Bash(echo \"ANDROID_HOME=$ANDROID_HOME\")",
+      "Bash(echo \"ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT\")",
+      "Read(//c/Users/bigcl/Downloads/aireceptionist/android/$LOCALAPPDATA/Android/**)",
+      "Read(//c/Users/bigcl/Downloads/aireceptionist/android/$HOME/AppData/Local/Android/**)",
+      "Read(//c//**)",
+      "Read(//c/Users/bigcl/AppData/Local/Android/**)",
+      "Bash(echo \"sdk.dir=C:\\\\\\\\Users\\\\\\\\bigcl\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Android\\\\\\\\Sdk\")",
+      "Bash(./gradlew assembleDebug)",
+      "Bash(npm ls:*)",
+      "Bash(C:/Users/bigcl/Android/Sdk/platform-tools/adb.exe devices:*)",
+      "Bash(REACT_NATIVE_PACKAGER_HOSTNAME=192.168.110.239 npx expo start --port 8081)",
+      "Bash(netsh advfirewall:*)",
+      "Bash(npx vercel:*)",
+      "Bash(vercel --prod --yes)"
+    ]
+  }
+}

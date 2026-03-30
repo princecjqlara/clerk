@@ -14,6 +14,7 @@ function addPermissions(androidManifest) {
     'android.permission.FOREGROUND_SERVICE_PHONE_CALL',
     'android.permission.MANAGE_OWN_CALLS',
     'android.permission.READ_CONTACTS',
+    'android.permission.INTERNET',
   ];
 
   const manifest = androidManifest.manifest;
@@ -131,6 +132,12 @@ function withNativeFiles(config) {
         getInCallServiceCode(packageName)
       );
 
+      // Write AudioBridge.kt
+      fs.writeFileSync(
+        path.join(serviceDir, 'AudioBridge.kt'),
+        getAudioBridgeCode(packageName)
+      );
+
       // Write AICallModule.kt (React Native bridge)
       fs.writeFileSync(
         path.join(moduleDir, 'AICallModule.kt'),
@@ -204,29 +211,53 @@ import android.media.AudioManager
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import ${packageName}.module.AICallModule
 
 class AIInCallService : InCallService() {
 
+    companion object {
+        private const val TAG = "AIInCallService"
+        var instance: AIInCallService? = null
+    }
+
     private val handler = Handler(Looper.getMainLooper())
     private var currentCall: Call? = null
+    private var audioBridge: AudioBridge? = null
+    private var callStartTime: Long = 0
 
     private val callCallback = object : Call.Callback() {
         override fun onStateChanged(call: Call, state: Int) {
+            val phoneNumber = call.details?.handle?.schemeSpecificPart ?: "Unknown"
+            val callId = call.hashCode().toString()
+
             when (state) {
                 Call.STATE_ACTIVE -> {
-                    setupAudio()
+                    callStartTime = System.currentTimeMillis()
+                    setupAudioForCall()
+
                     AICallModule.sendEvent("onCallAnswered", mapOf(
-                        "phoneNumber" to (call.details?.handle?.schemeSpecificPart ?: "Unknown"),
-                        "callId" to call.hashCode().toString()
+                        "phoneNumber" to phoneNumber,
+                        "callId" to callId
                     ))
+
+                    // Start the AI conversation loop via AudioBridge
+                    startAIConversation(callId, phoneNumber)
                 }
                 Call.STATE_DISCONNECTED -> {
+                    val duration = if (callStartTime > 0) {
+                        ((System.currentTimeMillis() - callStartTime) / 1000).toInt()
+                    } else 0
+
+                    stopAIConversation()
+
                     AICallModule.sendEvent("onCallDisconnected", mapOf(
-                        "phoneNumber" to (call.details?.handle?.schemeSpecificPart ?: "Unknown"),
-                        "callId" to call.hashCode().toString()
+                        "phoneNumber" to phoneNumber,
+                        "callId" to callId,
+                        "duration" to duration.toString()
                     ))
                     currentCall = null
+                    callStartTime = 0
                 }
             }
         }
@@ -252,14 +283,36 @@ class AIInCallService : InCallService() {
         super.onCallRemoved(call)
         call.unregisterCallback(callCallback)
         if (currentCall == call) {
+            stopAIConversation()
             currentCall = null
         }
     }
 
-    private fun setupAudio() {
+    private fun setupAudioForCall() {
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        audioManager.isSpeakerphoneOn = true
+        // Keep speakerphone OFF so TTS goes through earpiece/call audio to caller
+        audioManager.isSpeakerphoneOn = false
+    }
+
+    private fun startAIConversation(callId: String, phoneNumber: String) {
+        Log.d(TAG, "Starting AI conversation for call $callId from $phoneNumber")
+
+        audioBridge = AudioBridge(this) { event, data ->
+            // Forward AudioBridge events to JS via AICallModule
+            val eventData = data.toMutableMap()
+            eventData["callId"] = callId
+            eventData["phoneNumber"] = phoneNumber
+            AICallModule.sendEvent(event, eventData)
+        }
+
+        audioBridge?.start()
+    }
+
+    private fun stopAIConversation() {
+        Log.d(TAG, "Stopping AI conversation")
+        audioBridge?.stop()
+        audioBridge = null
     }
 
     fun answerCurrentCall() {
@@ -270,9 +323,11 @@ class AIInCallService : InCallService() {
         currentCall?.disconnect()
     }
 
-    companion object {
-        var instance: AIInCallService? = null
+    fun stopAI() {
+        stopAIConversation()
     }
+
+    fun getAudioBridge(): AudioBridge? = audioBridge
 
     override fun onCreate() {
         super.onCreate()
@@ -280,8 +335,731 @@ class AIInCallService : InCallService() {
     }
 
     override fun onDestroy() {
+        stopAIConversation()
         instance = null
         super.onDestroy()
+    }
+}
+`;
+}
+
+function getAudioBridgeCode(packageName) {
+  return `package ${packageName}.service
+
+import android.content.Context
+import android.media.*
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.os.Handler
+import android.os.HandlerThread
+import android.util.Log
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlin.math.sqrt
+
+/**
+ * AudioBridge manages the full AI conversation loop during a phone call:
+ *   1. Play welcome message or TTS greeting to caller
+ *   2. Record caller voice from call audio stream
+ *   3. Detect silence -> send audio to STT
+ *   4. Get AI response via JS bridge callback
+ *   5. Generate TTS and play response to caller
+ *   6. Loop until call ends
+ *
+ * Audio routing:
+ *   - Playback: USAGE_VOICE_COMMUNICATION so caller hears TTS through the call
+ *   - Capture: VOICE_COMMUNICATION source at 16kHz mono for call audio
+ */
+class AudioBridge(
+    private val context: Context,
+    private val eventCallback: (eventName: String, data: Map<String, String>) -> Unit
+) {
+    companion object {
+        private const val TAG = "AudioBridge"
+        private const val SAMPLE_RATE = 16000
+        private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
+        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
+        private const val PROXY_BASE = "http://10.0.2.2:3456" // localhost from Android emulator
+        private const val SILENCE_THRESHOLD_RMS = 500.0  // RMS below this = silence
+        private const val SILENCE_DURATION_MS = 1500L    // 1.5s of silence triggers transcription
+        private const val MIN_SPEECH_DURATION_MS = 500L  // Minimum speech before we consider it valid
+        private const val MAX_RECORD_DURATION_MS = 30000L // Max 30s recording per turn
+
+        // Set this to the real device IP if not using emulator
+        // For real device testing, use the machine's local network IP
+        var proxyBaseUrl: String = PROXY_BASE
+    }
+
+    // State
+    enum class State {
+        IDLE, PLAYING_WELCOME, LISTENING, PROCESSING_STT, WAITING_AI, PLAYING_RESPONSE, STOPPED
+    }
+
+    @Volatile private var state: State = State.IDLE
+    @Volatile private var isRunning = false
+
+    // Audio recording
+    private var audioRecord: AudioRecord? = null
+    private var recordingThread: Thread? = null
+    private val recordedAudio = ByteArrayOutputStream()
+
+    // Audio playback
+    private var audioTrack: AudioTrack? = null
+
+    // Silence detection
+    @Volatile private var lastSpeechTime = 0L
+    @Volatile private var recordingStartTime = 0L
+    @Volatile private var hasSpeechStarted = false
+
+    // Handler for async work
+    private val handlerThread = HandlerThread("AudioBridgeWorker").apply { start() }
+    private val workerHandler = Handler(handlerThread.looper)
+
+    // Transcript accumulator
+    private val transcript = mutableListOf<Map<String, String>>()
+
+    // AI response callback — set by JS bridge when AI responds
+    @Volatile var pendingAIResponse: String? = null
+    private val aiResponseLock = Object()
+
+    fun start() {
+        if (isRunning) return
+        isRunning = true
+        state = State.IDLE
+
+        Log.d(TAG, "AudioBridge starting conversation loop")
+        emitEvent("onCallFlowUpdate", mapOf("state" to "starting"))
+
+        workerHandler.post {
+            runConversationLoop()
+        }
+    }
+
+    fun stop() {
+        Log.d(TAG, "AudioBridge stopping")
+        isRunning = false
+        state = State.STOPPED
+
+        stopRecording()
+        stopPlayback()
+
+        // Wake up any thread waiting for AI response
+        synchronized(aiResponseLock) {
+            aiResponseLock.notifyAll()
+        }
+
+        handlerThread.quitSafely()
+        emitEvent("onCallFlowUpdate", mapOf("state" to "stopped"))
+    }
+
+    fun supplyAIResponse(response: String) {
+        synchronized(aiResponseLock) {
+            pendingAIResponse = response
+            aiResponseLock.notifyAll()
+        }
+    }
+
+    fun getTranscript(): List<Map<String, String>> = transcript.toList()
+
+    // ===================== MAIN CONVERSATION LOOP =====================
+
+    private fun runConversationLoop() {
+        try {
+            // Step 1: Play welcome message
+            state = State.PLAYING_WELCOME
+            emitEvent("onCallFlowUpdate", mapOf("state" to "playing_welcome"))
+
+            val welcomePlayed = playWelcomeAudio()
+            if (!isRunning) return
+
+            if (!welcomePlayed) {
+                // No prerecorded welcome — request greeting from JS/AI
+                emitEvent("onCallFlowUpdate", mapOf("state" to "requesting_greeting"))
+                emitEvent("onRequestGreeting", mapOf("type" to "initial"))
+
+                // Wait for AI greeting to come back
+                val greeting = waitForAIResponse(15000)
+                if (!isRunning) return
+
+                if (greeting != null) {
+                    transcript.add(mapOf("role" to "ai", "text" to greeting))
+                    emitEvent("onAIResponse", mapOf("text" to greeting))
+
+                    // Generate and play TTS for the greeting
+                    val ttsPlayed = playTTSResponse(greeting)
+                    if (!ttsPlayed) {
+                        Log.w(TAG, "Failed to play TTS greeting")
+                    }
+                }
+            }
+
+            // Step 2: Conversation loop
+            while (isRunning) {
+                if (!isRunning) break
+
+                // Listen for caller speech
+                state = State.LISTENING
+                emitEvent("onCallFlowUpdate", mapOf("state" to "listening"))
+
+                val audioData = recordCallerSpeech()
+                if (!isRunning || audioData == null || audioData.isEmpty()) {
+                    if (isRunning) {
+                        // No speech detected, keep listening
+                        continue
+                    }
+                    break
+                }
+
+                // Send to STT
+                state = State.PROCESSING_STT
+                emitEvent("onCallFlowUpdate", mapOf("state" to "transcribing"))
+
+                val transcription = sendToSTT(audioData)
+                if (!isRunning) break
+
+                if (transcription.isNullOrBlank()) {
+                    Log.d(TAG, "Empty transcription, resuming listening")
+                    continue
+                }
+
+                Log.d(TAG, "Caller said: $transcription")
+                transcript.add(mapOf("role" to "caller", "text" to transcription))
+                emitEvent("onTranscription", mapOf("text" to transcription))
+
+                // Request AI response from JS side
+                state = State.WAITING_AI
+                emitEvent("onCallFlowUpdate", mapOf("state" to "thinking"))
+                emitEvent("onRequestAIResponse", mapOf("text" to transcription))
+
+                val aiResponse = waitForAIResponse(20000)
+                if (!isRunning) break
+
+                if (aiResponse.isNullOrBlank()) {
+                    Log.w(TAG, "No AI response received, resuming listening")
+                    continue
+                }
+
+                Log.d(TAG, "AI response: $aiResponse")
+                transcript.add(mapOf("role" to "ai", "text" to aiResponse))
+                emitEvent("onAIResponse", mapOf("text" to aiResponse))
+
+                // Generate TTS and play to caller
+                state = State.PLAYING_RESPONSE
+                emitEvent("onCallFlowUpdate", mapOf("state" to "speaking"))
+
+                val played = playTTSResponse(aiResponse)
+                if (!isRunning) break
+
+                if (!played) {
+                    Log.w(TAG, "Failed to play TTS response")
+                }
+
+                // Small pause before next listen cycle
+                Thread.sleep(300)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Conversation loop error", e)
+            emitEvent("onCallFlowUpdate", mapOf("state" to "error", "error" to (e.message ?: "Unknown error")))
+        } finally {
+            stopRecording()
+            stopPlayback()
+        }
+    }
+
+    // ===================== WELCOME MESSAGE =====================
+
+    private fun playWelcomeAudio(): Boolean {
+        try {
+            val url = URL("$proxyBaseUrl/api/welcome/default")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 5000
+            conn.readTimeout = 10000
+
+            if (conn.responseCode != 200) {
+                conn.disconnect()
+                return false
+            }
+
+            val audioBytes = conn.inputStream.readBytes()
+            conn.disconnect()
+
+            if (audioBytes.isEmpty()) return false
+
+            playAudioToCall(audioBytes)
+            return true
+        } catch (e: Exception) {
+            Log.w(TAG, "Welcome audio not available: \${e.message}")
+            return false
+        }
+    }
+
+    // ===================== VOICE RECORDING =====================
+
+    private fun recordCallerSpeech(): ByteArray? {
+        val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
+        if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
+            Log.e(TAG, "Invalid AudioRecord buffer size")
+            return null
+        }
+
+        val bufferSize = maxOf(minBufferSize * 2, SAMPLE_RATE * 2) // At least 1 second buffer
+
+        try {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                SAMPLE_RATE,
+                CHANNEL_CONFIG,
+                AUDIO_FORMAT,
+                bufferSize
+            )
+
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioRecord failed to initialize")
+                audioRecord?.release()
+                audioRecord = null
+                return null
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "RECORD_AUDIO permission not granted", e)
+            return null
+        }
+
+        recordedAudio.reset()
+        hasSpeechStarted = false
+        lastSpeechTime = System.currentTimeMillis()
+        recordingStartTime = System.currentTimeMillis()
+
+        audioRecord?.startRecording()
+        Log.d(TAG, "Started recording caller voice")
+
+        val buffer = ShortArray(bufferSize / 2)
+        var silenceStartTime = System.currentTimeMillis()
+
+        try {
+            while (isRunning) {
+                val readCount = audioRecord?.read(buffer, 0, buffer.size) ?: -1
+                if (readCount <= 0) {
+                    Thread.sleep(10)
+                    continue
+                }
+
+                // Write raw PCM to buffer
+                val byteBuffer = ByteArray(readCount * 2)
+                for (i in 0 until readCount) {
+                    byteBuffer[i * 2] = (buffer[i].toInt() and 0xFF).toByte()
+                    byteBuffer[i * 2 + 1] = (buffer[i].toInt() shr 8 and 0xFF).toByte()
+                }
+                recordedAudio.write(byteBuffer, 0, byteBuffer.size)
+
+                // Calculate RMS for silence detection
+                val rms = calculateRMS(buffer, readCount)
+
+                val now = System.currentTimeMillis()
+
+                if (rms > SILENCE_THRESHOLD_RMS) {
+                    // Speech detected
+                    if (!hasSpeechStarted) {
+                        hasSpeechStarted = true
+                        Log.d(TAG, "Speech started (RMS: $rms)")
+                    }
+                    lastSpeechTime = now
+                    silenceStartTime = now
+                } else if (hasSpeechStarted) {
+                    // Silence after speech
+                    val silenceDuration = now - silenceStartTime
+                    if (silenceDuration >= SILENCE_DURATION_MS) {
+                        Log.d(TAG, "Silence detected for \${silenceDuration}ms, stopping recording")
+                        break
+                    }
+                }
+
+                // Check max recording duration
+                if (now - recordingStartTime > MAX_RECORD_DURATION_MS) {
+                    Log.d(TAG, "Max recording duration reached")
+                    break
+                }
+
+                // If no speech after 10 seconds, return null to restart
+                if (!hasSpeechStarted && (now - recordingStartTime > 10000)) {
+                    Log.d(TAG, "No speech detected for 10s, restarting listen")
+                    stopRecording()
+                    return null
+                }
+            }
+        } finally {
+            stopRecording()
+        }
+
+        if (!hasSpeechStarted) return null
+
+        val speechDuration = lastSpeechTime - recordingStartTime
+        if (speechDuration < MIN_SPEECH_DURATION_MS) {
+            Log.d(TAG, "Speech too short (\${speechDuration}ms), ignoring")
+            return null
+        }
+
+        return recordedAudio.toByteArray()
+    }
+
+    private fun calculateRMS(buffer: ShortArray, length: Int): Double {
+        var sum = 0.0
+        for (i in 0 until length) {
+            sum += buffer[i].toDouble() * buffer[i].toDouble()
+        }
+        return sqrt(sum / length)
+    }
+
+    private fun stopRecording() {
+        try {
+            audioRecord?.stop()
+        } catch (e: Exception) {
+            // Ignore
+        }
+        try {
+            audioRecord?.release()
+        } catch (e: Exception) {
+            // Ignore
+        }
+        audioRecord = null
+    }
+
+    // ===================== STT (Speech-to-Text) =====================
+
+    private fun sendToSTT(audioData: ByteArray): String? {
+        try {
+            // Build WAV from raw PCM
+            val wavData = buildWav(audioData, SAMPLE_RATE, 1, 16)
+
+            val url = URL("$proxyBaseUrl/api/stt")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "audio/wav")
+            conn.connectTimeout = 10000
+            conn.readTimeout = 30000
+
+            conn.outputStream.use { it.write(wavData) }
+
+            if (conn.responseCode != 200) {
+                val errorBody = try { conn.errorStream?.bufferedReader()?.readText() } catch (e: Exception) { "unknown" }
+                Log.e(TAG, "STT failed: \${conn.responseCode} - $errorBody")
+                conn.disconnect()
+                return null
+            }
+
+            val responseBody = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+
+            // Parse JSON response: { "transcript": "...", "detectedLang": "..." }
+            val jsonResponse = org.json.JSONObject(responseBody)
+            val transcript = jsonResponse.optString("transcript", "")
+            return transcript.takeIf { it.isNotBlank() }
+        } catch (e: Exception) {
+            Log.e(TAG, "STT error", e)
+            return null
+        }
+    }
+
+    private fun buildWav(pcmData: ByteArray, sampleRate: Int, channels: Int, bitsPerSample: Int): ByteArray {
+        val dataSize = pcmData.size
+        val headerSize = 44
+        val totalSize = headerSize + dataSize
+        val byteRate = sampleRate * channels * bitsPerSample / 8
+        val blockAlign = channels * bitsPerSample / 8
+
+        val wav = ByteArray(totalSize)
+
+        // RIFF header
+        wav[0] = 'R'.code.toByte(); wav[1] = 'I'.code.toByte()
+        wav[2] = 'F'.code.toByte(); wav[3] = 'F'.code.toByte()
+        writeInt32LE(wav, 4, totalSize - 8)
+        wav[8] = 'W'.code.toByte(); wav[9] = 'A'.code.toByte()
+        wav[10] = 'V'.code.toByte(); wav[11] = 'E'.code.toByte()
+
+        // fmt chunk
+        wav[12] = 'f'.code.toByte(); wav[13] = 'm'.code.toByte()
+        wav[14] = 't'.code.toByte(); wav[15] = ' '.code.toByte()
+        writeInt32LE(wav, 16, 16) // chunk size
+        writeInt16LE(wav, 20, 1)  // PCM format
+        writeInt16LE(wav, 22, channels)
+        writeInt32LE(wav, 24, sampleRate)
+        writeInt32LE(wav, 28, byteRate)
+        writeInt16LE(wav, 32, blockAlign)
+        writeInt16LE(wav, 34, bitsPerSample)
+
+        // data chunk
+        wav[36] = 'd'.code.toByte(); wav[37] = 'a'.code.toByte()
+        wav[38] = 't'.code.toByte(); wav[39] = 'a'.code.toByte()
+        writeInt32LE(wav, 40, dataSize)
+
+        System.arraycopy(pcmData, 0, wav, 44, dataSize)
+        return wav
+    }
+
+    private fun writeInt32LE(buf: ByteArray, offset: Int, value: Int) {
+        buf[offset] = (value and 0xFF).toByte()
+        buf[offset + 1] = (value shr 8 and 0xFF).toByte()
+        buf[offset + 2] = (value shr 16 and 0xFF).toByte()
+        buf[offset + 3] = (value shr 24 and 0xFF).toByte()
+    }
+
+    private fun writeInt16LE(buf: ByteArray, offset: Int, value: Int) {
+        buf[offset] = (value and 0xFF).toByte()
+        buf[offset + 1] = (value shr 8 and 0xFF).toByte()
+    }
+
+    // ===================== TTS PLAYBACK =====================
+
+    private fun playTTSResponse(text: String): Boolean {
+        try {
+            // Try ElevenLabs first, fall back to Edge TTS
+            var audioBytes = fetchTTSAudio("$proxyBaseUrl/api/elevenlabs/tts", text)
+            if (audioBytes == null) {
+                audioBytes = fetchTTSAudio("$proxyBaseUrl/api/tts", text)
+            }
+
+            if (audioBytes == null || audioBytes.isEmpty()) {
+                Log.w(TAG, "No TTS audio received")
+                return false
+            }
+
+            playAudioToCall(audioBytes)
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "TTS playback error", e)
+            return false
+        }
+    }
+
+    private fun fetchTTSAudio(endpoint: String, text: String): ByteArray? {
+        try {
+            val url = URL(endpoint)
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.connectTimeout = 10000
+            conn.readTimeout = 30000
+
+            val json = org.json.JSONObject()
+            json.put("text", text)
+            if (endpoint.contains("elevenlabs")) {
+                json.put("voice_id", "EXAVITQu4vr4xnSDxMaL")
+                json.put("model_id", "eleven_multilingual_v2")
+            } else {
+                json.put("voice", "fil-PH-BlessicaNeural")
+            }
+            val body = json.toString()
+
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+
+            if (conn.responseCode != 200) {
+                conn.disconnect()
+                return null
+            }
+
+            val audioBytes = conn.inputStream.readBytes()
+            conn.disconnect()
+            return audioBytes
+        } catch (e: Exception) {
+            Log.w(TAG, "TTS fetch failed from $endpoint: \${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * Plays audio bytes to the call using AudioTrack with USAGE_VOICE_COMMUNICATION.
+     * This routes the audio through the telephony audio path so the remote caller hears it,
+     * while the local device stays silent (no speaker output).
+     *
+     * Supports raw PCM and common audio container formats (the proxy returns mp3/wav/ogg).
+     * For non-PCM formats, we decode first using Android's MediaCodec/MediaExtractor.
+     */
+    private fun playAudioToCall(audioBytes: ByteArray) {
+        try {
+            // Try to decode the audio (could be mp3, wav, ogg from TTS proxy)
+            val pcmData = decodeAudioToPCM(audioBytes)
+            if (pcmData == null || pcmData.isEmpty()) {
+                Log.w(TAG, "Failed to decode audio to PCM")
+                return
+            }
+
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+
+            val audioFormat = AudioFormat.Builder()
+                .setSampleRate(SAMPLE_RATE)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build()
+
+            val minBuffer = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+
+            audioTrack = AudioTrack.Builder()
+                .setAudioAttributes(audioAttributes)
+                .setAudioFormat(audioFormat)
+                .setBufferSizeInBytes(maxOf(minBuffer, pcmData.size))
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+
+            audioTrack?.write(pcmData, 0, pcmData.size)
+            audioTrack?.play()
+
+            // Wait for playback to complete
+            val durationMs = (pcmData.size.toLong() * 1000) / (SAMPLE_RATE * 2) // 16-bit = 2 bytes per sample
+            Thread.sleep(durationMs + 200) // Small buffer
+
+            stopPlayback()
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio playback error", e)
+            stopPlayback()
+        }
+    }
+
+    /**
+     * Decodes audio bytes (mp3, wav, ogg, etc.) into raw PCM 16kHz mono 16-bit.
+     * Uses Android's MediaExtractor and MediaCodec.
+     */
+    private fun decodeAudioToPCM(audioBytes: ByteArray): ByteArray? {
+        try {
+            // Check if this is already raw PCM (no header magic bytes)
+            // WAV files start with "RIFF", MP3 with 0xFF 0xFB, OGG with "OggS"
+            val isWav = audioBytes.size > 44 &&
+                audioBytes[0] == 'R'.code.toByte() && audioBytes[1] == 'I'.code.toByte() &&
+                audioBytes[2] == 'F'.code.toByte() && audioBytes[3] == 'F'.code.toByte()
+
+            if (isWav) {
+                // Extract PCM data from WAV (skip 44-byte header) and resample if needed
+                val pcm = audioBytes.copyOfRange(44, audioBytes.size)
+                return pcm
+            }
+
+            // For other formats (mp3, ogg), use MediaCodec to decode
+            val tempFile = java.io.File(context.cacheDir, "tts_temp_\${System.currentTimeMillis()}.audio")
+            tempFile.writeBytes(audioBytes)
+
+            try {
+                val extractor = MediaExtractor()
+                extractor.setDataSource(tempFile.absolutePath)
+
+                if (extractor.trackCount == 0) {
+                    extractor.release()
+                    return null
+                }
+
+                extractor.selectTrack(0)
+                val format = extractor.getTrackFormat(0)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: return null
+
+                val codec = MediaCodec.createDecoderByType(mime)
+                val outputFormat = MediaFormat.createAudioFormat(
+                    MediaFormat.MIMETYPE_AUDIO_RAW, SAMPLE_RATE, 1
+                )
+                codec.configure(format, null, null, 0)
+                codec.start()
+
+                val output = ByteArrayOutputStream()
+                val bufferInfo = MediaCodec.BufferInfo()
+                var inputDone = false
+                var outputDone = false
+
+                while (!outputDone && isRunning) {
+                    // Feed input
+                    if (!inputDone) {
+                        val inputIdx = codec.dequeueInputBuffer(10000)
+                        if (inputIdx >= 0) {
+                            val inputBuffer = codec.getInputBuffer(inputIdx)!!
+                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                            if (sampleSize < 0) {
+                                codec.queueInputBuffer(inputIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inputDone = true
+                            } else {
+                                codec.queueInputBuffer(inputIdx, 0, sampleSize, extractor.sampleTime, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+
+                    // Drain output
+                    val outputIdx = codec.dequeueOutputBuffer(bufferInfo, 10000)
+                    if (outputIdx >= 0) {
+                        val outputBuffer = codec.getOutputBuffer(outputIdx)!!
+                        val pcmChunk = ByteArray(bufferInfo.size)
+                        outputBuffer.get(pcmChunk)
+                        output.write(pcmChunk)
+                        codec.releaseOutputBuffer(outputIdx, false)
+
+                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                            outputDone = true
+                        }
+                    }
+                }
+
+                codec.stop()
+                codec.release()
+                extractor.release()
+
+                return output.toByteArray()
+            } finally {
+                tempFile.delete()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio decode error", e)
+            return null
+        }
+    }
+
+    private fun stopPlayback() {
+        try {
+            audioTrack?.stop()
+        } catch (e: Exception) { /* ignore */ }
+        try {
+            audioTrack?.release()
+        } catch (e: Exception) { /* ignore */ }
+        audioTrack = null
+    }
+
+    // ===================== AI RESPONSE WAITING =====================
+
+    private fun waitForAIResponse(timeoutMs: Long): String? {
+        synchronized(aiResponseLock) {
+            pendingAIResponse = null
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (pendingAIResponse == null && isRunning) {
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0) break
+                try {
+                    aiResponseLock.wait(remaining)
+                } catch (e: InterruptedException) {
+                    break
+                }
+            }
+            val response = pendingAIResponse
+            pendingAIResponse = null
+            return response
+        }
+    }
+
+    // ===================== EVENTS =====================
+
+    private fun emitEvent(eventName: String, data: Map<String, String>) {
+        try {
+            eventCallback(eventName, data)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to emit event $eventName: \${e.message}")
+        }
     }
 }
 `;
@@ -298,16 +1076,41 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.telecom.TelecomManager
+import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import ${packageName}.service.AIInCallService
+import ${packageName}.service.AudioBridge
 
-class AICallModule(reactContext: ReactApplicationContext) :
-    ReactContextBaseJavaModule(reactContext) {
+class AICallModule(private val ctx: ReactApplicationContext) :
+    ReactContextBaseJavaModule(ctx) {
+
+    companion object {
+        private const val TAG = "AICallModule"
+        private var sharedContext: ReactApplicationContext? = null
+
+        fun init(context: ReactApplicationContext) {
+            sharedContext = context
+        }
+
+        fun sendEvent(eventName: String, params: Map<String, String>) {
+            val ctx = sharedContext ?: return
+            try {
+                val map = Arguments.createMap()
+                params.forEach { (key, value) -> map.putString(key, value) }
+                ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                    .emit(eventName, map)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to send event $eventName: \${e.message}")
+            }
+        }
+    }
 
     override fun getName() = "AICallModule"
+
+    // ==================== Call Control ====================
 
     @ReactMethod
     fun setReceptionistEnabled(enabled: Boolean, promise: Promise) {
@@ -342,9 +1145,65 @@ class AICallModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    // ==================== AI Conversation Control ====================
+
+    @ReactMethod
+    fun supplyAIResponse(response: String, promise: Promise) {
+        try {
+            val bridge = AIInCallService.instance?.getAudioBridge()
+            if (bridge != null) {
+                bridge.supplyAIResponse(response)
+                promise.resolve(true)
+            } else {
+                promise.reject("ERROR", "No active audio bridge")
+            }
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun stopAI(promise: Promise) {
+        try {
+            AIInCallService.instance?.stopAI()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun getCallTranscript(promise: Promise) {
+        try {
+            val bridge = AIInCallService.instance?.getAudioBridge()
+            if (bridge != null) {
+                val transcript = bridge.getTranscript()
+                val result = Arguments.createArray()
+                transcript.forEach { entry ->
+                    val map = Arguments.createMap()
+                    entry.forEach { (k, v) -> map.putString(k, v) }
+                    result.pushMap(map)
+                }
+                promise.resolve(result)
+            } else {
+                promise.resolve(Arguments.createArray())
+            }
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun setProxyBaseUrl(url: String, promise: Promise) {
+        AudioBridge.proxyBaseUrl = url
+        promise.resolve(true)
+    }
+
+    // ==================== Permissions ====================
+
     @ReactMethod
     fun requestPermissions(promise: Promise) {
-        val activity = currentActivity
+        val activity = ctx.currentActivity
         if (activity == null) {
             promise.reject("ERROR", "No activity")
             return
@@ -372,7 +1231,7 @@ class AICallModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun requestDefaultDialer(promise: Promise) {
-        val activity = currentActivity
+        val activity = ctx.currentActivity
         if (activity == null) {
             promise.reject("ERROR", "No activity")
             return
@@ -399,6 +1258,81 @@ class AICallModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    // ==================== On-Device Speech Recognition ====================
+
+    private var speechRecognizer: android.speech.SpeechRecognizer? = null
+
+    @ReactMethod
+    fun startListening(language: String, promise: Promise) {
+        val activity = ctx.currentActivity
+        if (activity == null) {
+            promise.reject("ERROR", "No activity")
+            return
+        }
+
+        activity.runOnUiThread {
+            try {
+                speechRecognizer?.destroy()
+                speechRecognizer = android.speech.SpeechRecognizer.createSpeechRecognizer(activity)
+
+                val intent = android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                intent.putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                intent.putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, language)
+                intent.putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
+                intent.putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                intent.putExtra(android.speech.RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+
+                speechRecognizer?.setRecognitionListener(object : android.speech.RecognitionListener {
+                    override fun onResults(results: android.os.Bundle?) {
+                        val matches = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
+                        val text = matches?.firstOrNull() ?: ""
+                        sendEvent("onSpeechResult", mapOf("text" to text, "isFinal" to "true"))
+                    }
+
+                    override fun onPartialResults(partialResults: android.os.Bundle?) {
+                        val matches = partialResults?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
+                        val text = matches?.firstOrNull() ?: ""
+                        if (text.isNotEmpty()) {
+                            sendEvent("onSpeechResult", mapOf("text" to text, "isFinal" to "false"))
+                        }
+                    }
+
+                    override fun onError(error: Int) {
+                        val errorMsg = when (error) {
+                            android.speech.SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected"
+                            android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Speech timeout"
+                            android.speech.SpeechRecognizer.ERROR_AUDIO -> "Audio error"
+                            else -> "Speech error: \\$error"
+                        }
+                        sendEvent("onSpeechError", mapOf("error" to errorMsg))
+                    }
+
+                    override fun onReadyForSpeech(params: android.os.Bundle?) {}
+                    override fun onBeginningOfSpeech() {}
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {}
+                    override fun onEvent(eventType: Int, params: android.os.Bundle?) {}
+                })
+
+                speechRecognizer?.startListening(intent)
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.reject("ERROR", e.message)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun stopListening(promise: Promise) {
+        try {
+            speechRecognizer?.stopListening()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
+    }
+
     @ReactMethod
     fun addListener(eventName: String) {
         // Required for RN event emitter
@@ -409,24 +1343,8 @@ class AICallModule(reactContext: ReactApplicationContext) :
         // Required for RN event emitter
     }
 
-    companion object {
-        private var reactContext: ReactApplicationContext? = null
-
-        fun init(context: ReactApplicationContext) {
-            reactContext = context
-        }
-
-        fun sendEvent(eventName: String, params: Map<String, String>) {
-            val ctx = reactContext ?: return
-            val map = Arguments.createMap()
-            params.forEach { (key, value) -> map.putString(key, value) }
-            ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-                .emit(eventName, map)
-        }
-    }
-
     init {
-        init(reactContext)
+        init(ctx)
     }
 }
 `;

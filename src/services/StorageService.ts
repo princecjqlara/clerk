@@ -7,6 +7,7 @@ const KEYS = {
   CUSTOM_INSTRUCTIONS: 'custom_instructions',
   CALL_LOG: 'call_log',
   BUSINESS_NAME: 'business_name',
+  CALL_GOAL: 'call_goal',
 };
 
 export async function getApiKey(): Promise<string> {
@@ -62,4 +63,12 @@ export async function addCallRecord(record: CallRecord): Promise<void> {
 
 export async function clearCallLog(): Promise<void> {
   await AsyncStorage.setItem(KEYS.CALL_LOG, '[]');
+}
+
+export async function getCallGoal(): Promise<string> {
+  return (await AsyncStorage.getItem(KEYS.CALL_GOAL)) || 'book';
+}
+
+export async function setCallGoal(goal: string): Promise<void> {
+  await AsyncStorage.setItem(KEYS.CALL_GOAL, goal);
 }
