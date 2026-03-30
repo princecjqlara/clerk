@@ -413,7 +413,7 @@ export default function HomeScreen({ onNavigate }: Props) {
         </View>
 
         {/* Permissions Setup (Android only) */}
-        {Platform.OS === 'android' && !enabled && (
+        {!enabled && (
           <View style={styles.permCard}>
             <Text style={styles.permTitle}>Setup Required</Text>
             <Text style={styles.permDesc}>Grant permissions so the AI can answer your calls.</Text>
