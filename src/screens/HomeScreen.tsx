@@ -42,6 +42,8 @@ interface Props {
 export default function HomeScreen({ onNavigate }: Props) {
   const [enabled, setEnabled] = useState(false);
   const [apiKeySet, setApiKeySet] = useState(false);
+  const [permissionsGranted, setPermissionsGranted] = useState(false);
+  const [isDefaultDialer, setIsDefaultDialer] = useState(false);
   const [callLog, setCallLog] = useState<CallLogEntry[]>([]);
   const [activeCall, setActiveCall] = useState<string | null>(null);
   const [activeCallId, setActiveCallId] = useState<string | null>(null);
@@ -274,6 +276,22 @@ export default function HomeScreen({ onNavigate }: Props) {
     setEnabled(value);
   };
 
+  const requestPerms = async () => {
+    if (Platform.OS !== 'android') return;
+    try {
+      const granted = await callService.requestPermissions();
+      setPermissionsGranted(granted);
+    } catch {}
+  };
+
+  const requestDialer = async () => {
+    if (Platform.OS !== 'android') return;
+    try {
+      await callService.requestDefaultDialer();
+      setIsDefaultDialer(true);
+    } catch {}
+  };
+
   const handleStopAI = async () => {
     try {
       await callService.stopAI();
@@ -393,6 +411,54 @@ export default function HomeScreen({ onNavigate }: Props) {
             <Text style={styles.warning}>Set NVIDIA API key in Settings to enable</Text>
           )}
         </View>
+
+        {/* Permissions Setup (Android only) */}
+        {Platform.OS === 'android' && !enabled && (
+          <View style={styles.permCard}>
+            <Text style={styles.permTitle}>Setup Required</Text>
+            <Text style={styles.permDesc}>Grant permissions so the AI can answer your calls.</Text>
+
+            <TouchableOpacity
+              style={[styles.permBtn, permissionsGranted && styles.permBtnDone]}
+              onPress={requestPerms}
+            >
+              <Text style={styles.permBtnText}>
+                {permissionsGranted ? '\u2713  Phone & Mic Permissions Granted' : '1. Grant Phone & Mic Permissions'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.permBtn, isDefaultDialer && styles.permBtnDone]}
+              onPress={requestDialer}
+            >
+              <Text style={styles.permBtnText}>
+                {isDefaultDialer ? '\u2713  Set as Default Dialer' : '2. Set as Default Phone App'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.permBtn, { backgroundColor: '#1a2e0a', borderColor: '#76b900' }]}
+              onPress={() => {
+                callService.setApiKeys(
+                  '7288b46b415eda427fab877bfd25ce6299bd5f6e',
+                  'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b',
+                  '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'
+                );
+                if (Platform.OS === 'web') {
+                  window.alert('API keys configured!');
+                } else {
+                  Alert.alert('Done', 'API keys configured for AI calls.');
+                }
+              }}
+            >
+              <Text style={[styles.permBtnText, { color: '#76b900' }]}>3. Configure API Keys</Text>
+            </TouchableOpacity>
+
+            {permissionsGranted && isDefaultDialer && (
+              <Text style={styles.permReady}>All set! Toggle the AI Receptionist switch above to start.</Text>
+            )}
+          </View>
+        )}
 
         {/* Active Call Banner with Live Details */}
         {activeCall && (
@@ -855,4 +921,18 @@ const styles = StyleSheet.create({
   msgRole: { fontSize: 11, color: '#888', marginBottom: 2 },
   msgText: { fontSize: 14, color: '#fff', lineHeight: 20 },
   noTranscript: { color: '#555', textAlign: 'center', paddingVertical: 20 },
+  // Permissions setup
+  permCard: {
+    marginHorizontal: 16, borderRadius: 16, padding: 16, marginBottom: 16,
+    backgroundColor: '#1a1a1a', borderWidth: 1, borderColor: '#333',
+  },
+  permTitle: { fontSize: 16, fontWeight: '700', color: '#fff', marginBottom: 4 },
+  permDesc: { fontSize: 13, color: '#888', marginBottom: 12 },
+  permBtn: {
+    backgroundColor: '#111', borderRadius: 10, padding: 14, marginBottom: 8,
+    borderWidth: 1, borderColor: '#333',
+  },
+  permBtnDone: { borderColor: '#76b900', backgroundColor: '#0a1a0a' },
+  permBtnText: { color: '#ccc', fontSize: 14, fontWeight: '500' },
+  permReady: { color: '#76b900', fontSize: 13, fontWeight: '600', textAlign: 'center', marginTop: 8 },
 });
