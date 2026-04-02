@@ -5,13 +5,13 @@ const DEFAULT_API_KEY = '';
 
 // Available models — tenant can choose in AI Config
 export const AVAILABLE_MODELS = [
-  { id: 'meta/llama-3.3-70b-instruct', name: 'Llama 3.3 70B', desc: 'Fast & smart — best for real-time calls', speed: 'fast' },
+  { id: 'meta/llama-3.1-8b-instruct', name: 'Llama 3.1 8B', desc: 'Fastest — best for real-time calls', speed: 'fastest' },
+  { id: 'meta/llama-3.3-70b-instruct', name: 'Llama 3.3 70B', desc: 'Smart & fast — great quality', speed: 'fast' },
   { id: 'meta/llama-3.1-405b-instruct', name: 'Llama 3.1 405B', desc: 'Smartest — slower but highest quality', speed: 'slow' },
   { id: 'nvidia/llama-3.1-nemotron-70b-instruct', name: 'Nemotron 70B', desc: 'NVIDIA-tuned — great at following instructions', speed: 'fast' },
-  { id: 'deepseek-ai/deepseek-r1-distill-llama-70b', name: 'DeepSeek R1 70B', desc: 'Reasoning model — best for complex conversations', speed: 'fast' },
 ] as const;
 
-let currentModel = 'meta/llama-3.3-70b-instruct';
+let currentModel = 'meta/llama-3.1-8b-instruct';
 
 export function setModel(modelId: string) {
   currentModel = modelId;
