@@ -45,10 +45,19 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
     const mod = NativeModules.AICallModule;
     setDebugMsg(`Platform: ${Platform.OS} | AICallModule: ${mod ? 'LOADED' : 'NULL'} | Methods: ${mod ? Object.keys(mod).join(', ') : 'none'}`);
 
-    Storage.getEnabled().then(setAiEnabled).catch(() => {});
+    // Sync enabled state to native SharedPreferences on load
+    Storage.getEnabled().then(async (enabled) => {
+      setAiEnabled(enabled);
+      // Always sync to native so SharedPreferences matches
+      try { await callService.setEnabled(enabled); } catch {}
+    }).catch(() => {});
+
     // Auto-check permissions on load
     callService.checkPermissions().then(setPermsGranted).catch(() => {});
     callService.checkDefaultDialer().then(setDialerSet).catch(() => {});
+
+    // Sync tenant config to native on load
+    syncTenantConfigToNative();
   }, []);
 
   // Subscribe to live call state changes
@@ -116,6 +125,57 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
       }, 1000);
     } catch (e: any) {
       setDebugMsg(`Dialer error: ${e?.message || e}`);
+    }
+  };
+
+  const syncTenantConfigToNative = async () => {
+    try {
+      const profile = await getCurrentProfile();
+      if (!profile) return;
+
+      let tenantData: any = null;
+      const { data: owned } = await supabaseAdmin
+        .from('tenants')
+        .select('*')
+        .eq('owner_id', profile.id)
+        .limit(1);
+
+      if (owned && owned.length > 0) {
+        tenantData = owned[0];
+      } else {
+        const { data: membership } = await supabaseAdmin
+          .from('tenant_members')
+          .select('tenant_id')
+          .eq('user_id', profile.id)
+          .limit(1);
+        if (membership && membership.length > 0) {
+          const { data: t } = await supabaseAdmin
+            .from('tenants')
+            .select('*')
+            .eq('id', membership[0].tenant_id)
+            .single();
+          if (t) tenantData = t;
+        }
+      }
+
+      if (tenantData) {
+        await callService.setTenantConfig(
+          tenantData.name || '',
+          tenantData.call_goal || 'book',
+          tenantData.custom_instructions || ''
+        );
+        // Also push API keys if tenant has custom ones
+        if (tenantData.nvidia_api_key) {
+          await callService.setApiKeys(
+            tenantData.deepgram_api_key || '',
+            tenantData.elevenlabs_api_key || '',
+            tenantData.nvidia_api_key || ''
+          );
+        }
+        setKeysSet(true);
+      }
+    } catch (e) {
+      console.warn('Failed to sync tenant config to native:', e);
     }
   };
 

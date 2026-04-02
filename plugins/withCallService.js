@@ -445,25 +445,22 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
 /**
- * AudioBridge manages the full AI conversation loop during a phone call:
- *   1. Play welcome message or TTS greeting to caller
- *   2. Record caller voice from call audio stream
- *   3. Detect silence -> send audio to STT
- *   4. Get AI response via JS bridge callback
- *   5. Generate TTS and play response to caller
- *   6. Loop until call ends
- *
- * Audio routing:
- *   - Playback: USAGE_VOICE_COMMUNICATION so caller hears TTS through the call
- *   - Capture: VOICE_COMMUNICATION source at 16kHz mono for call audio
+ * AudioBridge manages the full AI conversation loop during a phone call.
+ * Fallback chain for TTS: ElevenLabs API -> Android built-in TextToSpeech
  */
 class AudioBridge(
     private val context: Context,
@@ -474,28 +471,30 @@ class AudioBridge(
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val SILENCE_THRESHOLD_RMS = 500.0
-        private const val SILENCE_DURATION_MS = 1500L
-        private const val MIN_SPEECH_DURATION_MS = 500L
+        private const val SILENCE_THRESHOLD_RMS = 150.0
+        private const val SILENCE_DURATION_MS = 2000L
+        private const val MIN_SPEECH_DURATION_MS = 300L
         private const val MAX_RECORD_DURATION_MS = 30000L
 
-        // Direct API endpoints — no proxy needed
         private const val DEEPGRAM_STT_URL = "https://api.deepgram.com/v1/listen?model=nova-3&language=tl&punctuate=true&smart_format=true&numerals=true"
         private const val ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/"
         private const val NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-        // API keys — loaded from SharedPreferences (set by tenant config)
         var deepgramApiKey: String = "7288b46b415eda427fab877bfd25ce6299bd5f6e"
         var elevenLabsApiKey: String = "sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b"
         var nvidiaApiKey: String = "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"
         var elevenLabsVoiceId: String = "EXAVITQu4vr4xnSDxMaL"
         var aiModel: String = "meta/llama-3.3-70b-instruct"
 
-        // Legacy — kept for backward compat but not used for API calls
+        var businessName: String = ""
+        var customInstructions: String = ""
+        var callGoal: String = "book"
+
         var proxyBaseUrl: String = "http://10.0.2.2:3456"
+
+        @Volatile var activeInstance: AudioBridge? = null
     }
 
-    // State
     enum class State {
         IDLE, PLAYING_WELCOME, LISTENING, PROCESSING_STT, WAITING_AI, PLAYING_RESPONSE, STOPPED
     }
@@ -503,40 +502,102 @@ class AudioBridge(
     @Volatile private var state: State = State.IDLE
     @Volatile private var isRunning = false
 
-    // Audio recording
     private var audioRecord: AudioRecord? = null
     private var recordingThread: Thread? = null
     private val recordedAudio = ByteArrayOutputStream()
-
-    // Audio playback
     private var audioTrack: AudioTrack? = null
 
-    // Silence detection
+    private var androidTts: TextToSpeech? = null
+    @Volatile private var androidTtsReady = false
+
     @Volatile private var lastSpeechTime = 0L
     @Volatile private var recordingStartTime = 0L
     @Volatile private var hasSpeechStarted = false
 
-    // Handler for async work
     private val handlerThread = HandlerThread("AudioBridgeWorker").apply { start() }
     private val workerHandler = Handler(handlerThread.looper)
 
-    // Transcript accumulator
     private val transcript = mutableListOf<Map<String, String>>()
 
-    // AI response callback — set by JS bridge when AI responds
     @Volatile var pendingAIResponse: String? = null
     private val aiResponseLock = Object()
+
+    private val conversationHistory = mutableListOf<Map<String, String>>()
+    private var consecutiveAIFailures = 0
 
     fun start() {
         if (isRunning) return
         isRunning = true
         state = State.IDLE
+        activeInstance = this
+        consecutiveAIFailures = 0
 
         Log.d(TAG, "AudioBridge starting conversation loop")
         emitEvent("onCallFlowUpdate", mapOf("state" to "starting"))
 
-        workerHandler.post {
-            runConversationLoop()
+        loadTenantConfig()
+        initAndroidTts()
+
+        val systemPrompt = buildSystemPrompt()
+        conversationHistory.clear()
+        conversationHistory.add(mapOf("role" to "system", "content" to systemPrompt))
+
+        workerHandler.post { runConversationLoop() }
+    }
+
+    private fun loadTenantConfig() {
+        try {
+            val prefs = context.getSharedPreferences("ai_receptionist", Context.MODE_PRIVATE)
+            val b = prefs.getString("business_name", "") ?: ""
+            val i = prefs.getString("custom_instructions", "") ?: ""
+            val g = prefs.getString("call_goal", "book") ?: "book"
+            if (b.isNotBlank()) businessName = b
+            if (i.isNotBlank()) customInstructions = i
+            if (g.isNotBlank()) callGoal = g
+            Log.d(TAG, "Loaded tenant config: business='$businessName', goal='$callGoal'")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to load tenant config: \${e.message}")
+        }
+    }
+
+    private fun buildSystemPrompt(): String {
+        val goalPrompt = if (callGoal == "order") {
+            "YOUR PRIMARY GOAL: Help the caller PLACE AN ORDER. Take items, quantities, customizations, delivery/pickup, name, phone, address."
+        } else {
+            "YOUR PRIMARY GOAL: Help the caller BOOK AN APPOINTMENT. Collect: full name, date/time, service type, phone number, special requests."
+        }
+        var prompt = "You are a professional AI receptionist answering a phone call.\\n" +
+            "LANGUAGE: Speak in TAGLISH (mix of Tagalog and English).\\n" +
+            "STYLE: Sound like a real, friendly Filipino receptionist. Use po and opo. Keep responses SHORT (1-2 sentences max).\\n" +
+            "IMPORTANT: The caller's words come from speech-to-text and WILL have errors. Always understand the INTENT behind misspelled words.\\n" +
+            goalPrompt + "\\nAlways collect info step-by-step. Be conversational."
+        if (businessName.isNotBlank()) {
+            prompt += "\\n\\nYou are the receptionist for \\"$businessName\\". Use this name in your greeting."
+        }
+        if (customInstructions.isNotBlank()) {
+            prompt += "\\n\\nAdditional business info:\\n$customInstructions"
+        }
+        return prompt
+    }
+
+    private fun initAndroidTts() {
+        try {
+            androidTts = TextToSpeech(context) { status ->
+                if (status == TextToSpeech.SUCCESS) {
+                    androidTtsReady = true
+                    val result = androidTts?.setLanguage(Locale("fil", "PH"))
+                    if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        androidTts?.setLanguage(Locale.US)
+                    }
+                    androidTts?.setSpeechRate(0.9f)
+                    androidTts?.setPitch(1.05f)
+                    Log.d(TAG, "Android TTS initialized as fallback")
+                } else {
+                    androidTtsReady = false
+                }
+            }
+        } catch (e: Exception) {
+            androidTtsReady = false
         }
     }
 
@@ -544,15 +605,15 @@ class AudioBridge(
         Log.d(TAG, "AudioBridge stopping")
         isRunning = false
         state = State.STOPPED
+        if (activeInstance == this) activeInstance = null
 
         stopRecording()
         stopPlayback()
+        try { androidTts?.stop(); androidTts?.shutdown() } catch (e: Exception) {}
+        androidTts = null
+        androidTtsReady = false
 
-        // Wake up any thread waiting for AI response
-        synchronized(aiResponseLock) {
-            aiResponseLock.notifyAll()
-        }
-
+        synchronized(aiResponseLock) { aiResponseLock.notifyAll() }
         handlerThread.quitSafely()
         emitEvent("onCallFlowUpdate", mapOf("state" to "stopped"))
     }
@@ -570,7 +631,6 @@ class AudioBridge(
 
     private fun runConversationLoop() {
         try {
-            // Step 1: Play welcome message
             state = State.PLAYING_WELCOME
             emitEvent("onCallFlowUpdate", mapOf("state" to "playing_welcome"))
 
@@ -578,88 +638,82 @@ class AudioBridge(
             if (!isRunning) return
 
             if (!welcomePlayed) {
-                // No prerecorded welcome — request greeting from JS/AI
                 emitEvent("onCallFlowUpdate", mapOf("state" to "requesting_greeting"))
-                emitEvent("onRequestGreeting", mapOf("type" to "initial"))
-
-                // Wait for AI greeting to come back
-                val greeting = waitForAIResponse(15000)
+                conversationHistory.add(mapOf("role" to "user", "content" to "[Call connected. Greet the caller.]"))
+                val greeting = callNvidiaAI()
                 if (!isRunning) return
 
                 if (greeting != null) {
+                    conversationHistory.add(mapOf("role" to "assistant", "content" to greeting))
                     transcript.add(mapOf("role" to "ai", "text" to greeting))
                     emitEvent("onAIResponse", mapOf("text" to greeting))
-
-                    // Generate and play TTS for the greeting
                     val ttsPlayed = playTTSResponse(greeting)
-                    if (!ttsPlayed) {
-                        Log.w(TAG, "Failed to play TTS greeting")
-                    }
+                    if (!ttsPlayed) speakWithAndroidTts(greeting)
+                } else {
+                    val fallback = if (businessName.isNotBlank()) "Hello po! Salamat sa pag-tawag sa $businessName. Paano ko po kayo matutulungan?" else "Hello po! Salamat sa pag-tawag. Paano ko po kayo matutulungan ngayon?"
+                    speakWithAndroidTts(fallback)
+                    transcript.add(mapOf("role" to "ai", "text" to fallback))
+                    emitEvent("onAIResponse", mapOf("text" to fallback))
                 }
             }
 
-            // Step 2: Conversation loop
             while (isRunning) {
                 if (!isRunning) break
 
-                // Listen for caller speech
                 state = State.LISTENING
                 emitEvent("onCallFlowUpdate", mapOf("state" to "listening"))
 
                 val audioData = recordCallerSpeech()
                 if (!isRunning || audioData == null || audioData.isEmpty()) {
-                    if (isRunning) {
-                        // No speech detected, keep listening
-                        continue
-                    }
+                    if (isRunning) continue
                     break
                 }
 
-                // Send to STT
                 state = State.PROCESSING_STT
                 emitEvent("onCallFlowUpdate", mapOf("state" to "transcribing"))
 
                 val transcription = sendToSTT(audioData)
                 if (!isRunning) break
-
-                if (transcription.isNullOrBlank()) {
-                    Log.d(TAG, "Empty transcription, resuming listening")
-                    continue
-                }
+                if (transcription.isNullOrBlank()) { continue }
 
                 Log.d(TAG, "Caller said: $transcription")
                 transcript.add(mapOf("role" to "caller", "text" to transcription))
                 emitEvent("onTranscription", mapOf("text" to transcription))
 
-                // Request AI response from JS side
                 state = State.WAITING_AI
                 emitEvent("onCallFlowUpdate", mapOf("state" to "thinking"))
-                emitEvent("onRequestAIResponse", mapOf("text" to transcription))
 
-                val aiResponse = waitForAIResponse(20000)
+                conversationHistory.add(mapOf("role" to "user", "content" to transcription))
+                val aiResponse = callNvidiaAI()
                 if (!isRunning) break
 
                 if (aiResponse.isNullOrBlank()) {
-                    Log.w(TAG, "No AI response received, resuming listening")
+                    consecutiveAIFailures++
+                    if (consecutiveAIFailures <= 3) {
+                        val errorMsg = when (consecutiveAIFailures) {
+                            1 -> "Sandali lang po, nag-process pa po ako."
+                            2 -> "Pasensya na po, may technical difficulty po kami ngayon."
+                            else -> "Sorry po, hindi ko po ma-process ang request ninyo ngayon. Please try again later po."
+                        }
+                        speakWithAndroidTts(errorMsg)
+                        transcript.add(mapOf("role" to "ai", "text" to errorMsg))
+                        emitEvent("onAIResponse", mapOf("text" to errorMsg))
+                    }
+                    if (consecutiveAIFailures >= 3) break
                     continue
                 }
 
-                Log.d(TAG, "AI response: $aiResponse")
+                consecutiveAIFailures = 0
+                conversationHistory.add(mapOf("role" to "assistant", "content" to aiResponse))
                 transcript.add(mapOf("role" to "ai", "text" to aiResponse))
                 emitEvent("onAIResponse", mapOf("text" to aiResponse))
 
-                // Generate TTS and play to caller
                 state = State.PLAYING_RESPONSE
                 emitEvent("onCallFlowUpdate", mapOf("state" to "speaking"))
-
                 val played = playTTSResponse(aiResponse)
                 if (!isRunning) break
+                if (!played) speakWithAndroidTts(aiResponse)
 
-                if (!played) {
-                    Log.w(TAG, "Failed to play TTS response")
-                }
-
-                // Small pause before next listen cycle
                 Thread.sleep(300)
             }
         } catch (e: Exception) {
@@ -671,21 +725,109 @@ class AudioBridge(
         }
     }
 
+    // ===================== NVIDIA AI =====================
+
+    private fun callNvidiaAI(): String? {
+        try {
+            val url = URL(NVIDIA_CHAT_URL)
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Authorization", "Bearer $nvidiaApiKey")
+            conn.connectTimeout = 15000
+            conn.readTimeout = 30000
+
+            val messages = org.json.JSONArray()
+            for (msg in conversationHistory) {
+                val m = org.json.JSONObject()
+                m.put("role", msg["role"])
+                m.put("content", msg["content"])
+                messages.put(m)
+            }
+
+            val body = org.json.JSONObject()
+            body.put("model", aiModel)
+            body.put("messages", messages)
+            body.put("temperature", 0.7)
+            body.put("max_tokens", 120)
+
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+            if (conn.responseCode != 200) {
+                val err = try { conn.errorStream?.bufferedReader()?.readText() } catch (e: Exception) { "unknown" }
+                Log.e(TAG, "NVIDIA AI failed: \${conn.responseCode} - $err")
+                emitEvent("onCallFlowUpdate", mapOf("state" to "ai_error", "error" to "NVIDIA \${conn.responseCode}"))
+                conn.disconnect()
+                return null
+            }
+
+            val resp = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+
+            val json = org.json.JSONObject(resp)
+            val content = json.optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+                ?.optString("content", "") ?: ""
+            return content.takeIf { it.isNotBlank() }
+        } catch (e: Exception) {
+            Log.e(TAG, "NVIDIA AI error: \${e.message}", e)
+            return null
+        }
+    }
+
     // ===================== WELCOME MESSAGE =====================
 
     private fun playWelcomeAudio(): Boolean {
-        // Generate welcome greeting directly via ElevenLabs
+        val welcomeText = if (businessName.isNotBlank()) "Hello po! Salamat sa pag-tawag sa $businessName. Paano ko po kayo matutulungan ngayon?" else "Hello po! Salamat sa pag-tawag. Paano ko po kayo matutulungan ngayon?"
         try {
-            val welcomeText = "Hello po! Salamat sa pag-tawag. Paano ko po kayo matutulungan ngayon?"
             val audioBytes = fetchElevenLabsTTS(welcomeText)
             if (audioBytes != null && audioBytes.isNotEmpty()) {
                 playAudioToCall(audioBytes)
+                transcript.add(mapOf("role" to "ai", "text" to welcomeText))
+                emitEvent("onAIResponse", mapOf("text" to welcomeText))
                 return true
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Welcome TTS failed: \${e.message}")
+            Log.w(TAG, "Welcome ElevenLabs TTS failed: \${e.message}")
         }
+        try {
+            val spoken = speakWithAndroidTts(welcomeText)
+            if (spoken) {
+                transcript.add(mapOf("role" to "ai", "text" to welcomeText))
+                emitEvent("onAIResponse", mapOf("text" to welcomeText))
+                return true
+            }
+        } catch (e: Exception) {}
         return false
+    }
+
+    // ===================== ANDROID TTS FALLBACK =====================
+
+    private fun speakWithAndroidTts(text: String): Boolean {
+        if (!androidTtsReady || androidTts == null) return false
+        try {
+            val latch = CountDownLatch(1)
+            val utteranceId = "fallback_\${System.currentTimeMillis()}"
+            androidTts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(id: String?) {}
+                override fun onDone(id: String?) { latch.countDown() }
+                override fun onError(id: String?) { latch.countDown() }
+                @Deprecated("Deprecated in Java")
+                override fun onError(utteranceId: String?, errorCode: Int) { latch.countDown() }
+            })
+            val audioAttrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            androidTts?.setAudioAttributes(audioAttrs)
+            val result = androidTts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+            if (result != TextToSpeech.SUCCESS) return false
+            latch.await(15, TimeUnit.SECONDS)
+            Thread.sleep(300)
+            return true
+        } catch (e: Exception) { return false }
     }
 
     // ===================== VOICE RECORDING =====================
@@ -1379,6 +1521,21 @@ class AICallModule(private val ctx: ReactApplicationContext) :
         if (voiceId.isNotBlank()) AudioBridge.elevenLabsVoiceId = voiceId
         if (model.isNotBlank()) AudioBridge.aiModel = model
         Log.d(TAG, "Voice config updated: voice=$voiceId model=$model")
+        promise.resolve(true)
+    }
+
+    @ReactMethod
+    fun setTenantConfig(businessName: String, callGoal: String, customInstructions: String, promise: Promise) {
+        val prefs = reactApplicationContext.getSharedPreferences("ai_receptionist", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString("business_name", businessName)
+            .putString("call_goal", callGoal)
+            .putString("custom_instructions", customInstructions)
+            .apply()
+        AudioBridge.businessName = businessName
+        AudioBridge.callGoal = callGoal
+        AudioBridge.customInstructions = customInstructions
+        Log.d(TAG, "Tenant config saved: business='$businessName', goal='$callGoal'")
         promise.resolve(true)
     }
 

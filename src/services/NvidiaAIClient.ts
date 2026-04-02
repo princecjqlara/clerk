@@ -12,7 +12,7 @@ export const AVAILABLE_MODELS = [
   { id: 'deepseek-ai/deepseek-r1-distill-llama-70b', name: 'DeepSeek R1 70B', desc: 'Reasoning model — best for complex conversations', speed: 'fast' },
 ] as const;
 
-let currentModel = 'meta/llama-3.3-70b-instruct'; // Default: fast + smart (3-4x faster than 405B)
+let currentModel = 'meta/llama-3.3-70b-instruct';
 
 export function setModel(modelId: string) {
   currentModel = modelId;
@@ -46,25 +46,39 @@ export async function chatCompletion(
   const key = apiKey || DEFAULT_API_KEY;
   const endpoint = getEndpoint();
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${key}`,
-    },
-    body: JSON.stringify({
-      model: currentModel,
-      messages,
-      temperature: 0.7,
-      max_tokens: 120,
-    }),
-  });
+  // Add timeout so requests don't hang forever
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 20000);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`NVIDIA NIM API error ${response.status}: ${errorText}`);
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: currentModel,
+        messages,
+        temperature: 0.7,
+        max_tokens: 120,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`NVIDIA NIM API error ${response.status}: ${errorText}`);
+    }
+
+    const data: NIMResponse = await response.json();
+    return data.choices[0]?.message?.content ?? 'I apologize, I could not process that.';
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      throw new Error('AI request timed out after 20 seconds. Check your network connection.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  const data: NIMResponse = await response.json();
-  return data.choices[0]?.message?.content ?? 'I apologize, I could not process that.';
 }

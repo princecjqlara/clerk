@@ -213,6 +213,12 @@ class CallService {
     }
   }
 
+  async setTenantConfig(businessName: string, callGoal: string, customInstructions: string): Promise<void> {
+    if (AICallModule?.setTenantConfig) {
+      await AICallModule.setTenantConfig(businessName, callGoal, customInstructions);
+    }
+  }
+
   destroy() {
     this.emitter?.removeAllListeners('onIncomingCall');
     this.emitter?.removeAllListeners('onCallAnswered');

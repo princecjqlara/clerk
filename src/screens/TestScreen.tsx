@@ -100,12 +100,20 @@ export default function TestScreen({ onBack }: Props) {
 
       // Try prerecorded welcome first, fall back to TTS
       const tenantId = 'default';
-      const playedWelcome = await playWelcomeMessage(tenantId);
-      if (!playedWelcome) {
+      try {
+        const playedWelcome = await playWelcomeMessage(tenantId);
+        if (!playedWelcome) {
+          speak(greeting);
+        }
+      } catch {
+        // Welcome message failed, just use TTS
         speak(greeting);
       }
     } catch (err: any) {
-      setMessages([{ role: 'ai', text: `Error: ${err.message}` }]);
+      const errorMsg = err.message || 'Unknown error';
+      console.error('Test call error:', errorMsg);
+      setMessages([{ role: 'ai', text: `Error: ${errorMsg}` }]);
+      setInitError(errorMsg);
     }
     setLoading(false);
   };
