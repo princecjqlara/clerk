@@ -22,14 +22,6 @@ export function getModel(): string {
   return currentModel;
 }
 
-// Use proxy on web to avoid CORS, direct on native
-function getEndpoint(): string {
-  if (Platform.OS === 'web') {
-    return PROXY_ENDPOINT;
-  }
-  return NVIDIA_NIM_ENDPOINT;
-}
-
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -39,19 +31,17 @@ interface NIMResponse {
   choices: { message: { content: string } }[];
 }
 
-export async function chatCompletion(
-  apiKey: string = DEFAULT_API_KEY,
+async function fetchWithTimeout(
+  url: string,
+  key: string,
   messages: ChatMessage[],
+  timeoutMs: number,
 ): Promise<string> {
-  const key = apiKey || DEFAULT_API_KEY;
-  const endpoint = getEndpoint();
-
-  // Add timeout so requests don't hang forever
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 20000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(endpoint, {
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -68,17 +58,46 @@ export async function chatCompletion(
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`NVIDIA NIM API error ${response.status}: ${errorText}`);
+      throw new Error(`NVIDIA API error ${response.status}: ${errorText}`);
     }
 
     const data: NIMResponse = await response.json();
     return data.choices[0]?.message?.content ?? 'I apologize, I could not process that.';
-  } catch (err: any) {
-    if (err.name === 'AbortError') {
-      throw new Error('AI request timed out after 20 seconds. Check your network connection.');
-    }
-    throw err;
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+export async function chatCompletion(
+  apiKey: string = DEFAULT_API_KEY,
+  messages: ChatMessage[],
+): Promise<string> {
+  const key = apiKey || DEFAULT_API_KEY;
+
+  if (Platform.OS !== 'web') {
+    // Native: always use direct endpoint
+    return fetchWithTimeout(NVIDIA_NIM_ENDPOINT, key, messages, 20000);
+  }
+
+  // Web: try direct NVIDIA API first, fall back to proxy if CORS blocks it
+  try {
+    return await fetchWithTimeout(NVIDIA_NIM_ENDPOINT, key, messages, 15000);
+  } catch (directErr: any) {
+    // If it was a real API error (not network/CORS), don't retry via proxy
+    if (directErr.message?.includes('NVIDIA API error')) {
+      throw directErr;
+    }
+
+    // CORS or network error — try proxy as fallback
+    console.log('Direct NVIDIA API failed (likely CORS), trying proxy...', directErr.message);
+    try {
+      return await fetchWithTimeout(PROXY_ENDPOINT, key, messages, 15000);
+    } catch (proxyErr: any) {
+      // Both failed — give a helpful error
+      throw new Error(
+        'Could not reach AI service. Direct API blocked by CORS and proxy at localhost:3456 is not running. ' +
+        'Run the proxy server or test on the Android app instead.'
+      );
+    }
   }
 }
