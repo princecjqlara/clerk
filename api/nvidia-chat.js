@@ -1,5 +1,4 @@
-export default async function handler(req, res) {
-  // CORS
+module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -27,4 +26,4 @@ export default async function handler(req, res) {
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
-}
+};

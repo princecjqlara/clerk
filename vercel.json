@@ -2,7 +2,11 @@
   "installCommand": "npm install",
   "buildCommand": "npx expo export --platform web",
   "outputDirectory": "dist",
-  "framework": null,
+  "functions": {
+    "api/*.js": {
+      "runtime": "@vercel/node@3"
+    }
+  },
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/$1" },
     { "source": "/(.*)", "destination": "/index.html" }
