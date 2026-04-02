@@ -18,7 +18,7 @@ export default async function handler(req) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: req.headers.get('authorization') || `Bearer ${process.env.NVIDIA_API_KEY || ''}`,
+        Authorization: req.headers.get('authorization') || `Bearer ${process.env.NVIDIA_API_KEY || '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'}`,
       },
       body: JSON.stringify(body),
     });
