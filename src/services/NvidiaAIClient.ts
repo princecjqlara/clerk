@@ -47,7 +47,7 @@ export async function chatCompletion(
   const key = apiKey || DEFAULT_API_KEY;
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 20000);
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
 
   // Native: call NVIDIA directly. Web: use our serverless proxy to avoid CORS.
   const endpoint = Platform.OS === 'web' ? getWebProxyEndpoint() : NVIDIA_NIM_ENDPOINT;
@@ -77,7 +77,7 @@ export async function chatCompletion(
     return data.choices[0]?.message?.content ?? 'I apologize, I could not process that.';
   } catch (err: any) {
     if (err.name === 'AbortError') {
-      throw new Error('AI request timed out after 20 seconds. Check your network connection.');
+      throw new Error('AI request timed out after 45 seconds. Check your network connection.');
     }
     throw err;
   } finally {

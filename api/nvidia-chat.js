@@ -1,29 +1,40 @@
-module.exports = async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+export const config = { runtime: 'edge' };
 
+export default async function handler(req) {
   if (req.method === 'OPTIONS') {
-    return res.status(204).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      },
+    });
   }
 
   try {
+    const body = await req.json();
     const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: req.headers.authorization || '',
+        Authorization: req.headers.get('authorization') || '',
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(body),
     });
 
     const data = await response.text();
-    res.status(response.status).setHeader('Content-Type', 'application/json').end(data);
+    return new Response(data, {
+      status: response.status,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    });
   }
-};
+}

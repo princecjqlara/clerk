@@ -1,20 +1,23 @@
-module.exports = async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, xi-api-key');
+export const config = { runtime: 'edge' };
 
+const DEFAULT_KEY = 'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b';
+
+export default async function handler(req) {
   if (req.method === 'OPTIONS') {
-    return res.status(204).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, xi-api-key',
+      },
+    });
   }
 
   try {
-    const { text, voice_id, model_id, voice_settings, api_key } = req.body;
-    const voiceId = voice_id || 'EXAVITQu4vr4xnSDxMaL';
-    const apiKey = req.headers['xi-api-key'] || api_key || 'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b';
+    const body = await req.json();
+    const voiceId = body.voice_id || 'EXAVITQu4vr4xnSDxMaL';
+    const apiKey = req.headers.get('xi-api-key') || body.api_key || DEFAULT_KEY;
 
     const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voiceId, {
       method: 'POST',
@@ -23,19 +26,24 @@ module.exports = async function handler(req, res) {
         'xi-api-key': apiKey,
       },
       body: JSON.stringify({
-        text: text,
-        model_id: model_id || 'eleven_multilingual_v2',
-        voice_settings: voice_settings || { stability: 0.5, similarity_boost: 0.75 },
+        text: body.text,
+        model_id: body.model_id || 'eleven_multilingual_v2',
+        voice_settings: body.voice_settings || { stability: 0.5, similarity_boost: 0.75 },
       }),
     });
 
     const buffer = await response.arrayBuffer();
-    const contentType = response.headers.get('content-type') || 'audio/mpeg';
-    res
-      .status(response.status)
-      .setHeader('Content-Type', contentType)
-      .end(Buffer.from(buffer));
+    return new Response(buffer, {
+      status: response.status,
+      headers: {
+        'Content-Type': response.headers.get('content-type') || 'audio/mpeg',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    });
   }
-};
+}

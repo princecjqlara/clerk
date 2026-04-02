@@ -1,4 +1,8 @@
-module.exports = function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.status(200).json({ exists: false });
-};
+export const config = { runtime: 'edge' };
+
+export default function handler() {
+  return new Response(JSON.stringify({ exists: false }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+  });
+}
