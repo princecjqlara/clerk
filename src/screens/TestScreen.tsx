@@ -7,7 +7,7 @@ import { speak, stopSpeaking, startListeningWeb, stopListeningWeb, isWebListenin
 import { supabaseAdmin } from '../services/SupabaseClient';
 import { getCurrentProfile } from '../services/AuthService';
 
-const DEFAULT_API_KEY = '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';
+const DEFAULT_API_KEY = '';
 
 interface Props {
   onBack: () => void;

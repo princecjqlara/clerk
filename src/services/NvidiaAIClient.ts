@@ -1,7 +1,7 @@
 import { Platform } from 'react-native';
 
 const NVIDIA_NIM_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const DEFAULT_API_KEY = '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';
+const DEFAULT_API_KEY = '';
 
 // Available models — tenant can choose in AI Config
 export const AVAILABLE_MODELS = [

@@ -1,6 +1,6 @@
 export const config = { runtime: 'edge' };
 
-const DEFAULT_KEY = 'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b';
+const DEFAULT_KEY = process.env.ELEVENLABS_API_KEY || '';
 
 export default async function handler(req) {
   if (req.method === 'OPTIONS') {

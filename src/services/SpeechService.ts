@@ -5,7 +5,7 @@ import { Platform, NativeModules } from 'react-native';
 const PROXY_BASE = 'http://localhost:3456';
 const TTS_PROXY = `${PROXY_BASE}/api/tts`;
 const ELEVENLABS_TTS_PROXY = `${PROXY_BASE}/api/elevenlabs/tts`;
-const ELEVENLABS_API_KEY = 'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b';
+const ELEVENLABS_API_KEY = '';
 const STT_PROXY = `${PROXY_BASE}/api/stt`;
 const STT_WS = 'ws://localhost:3456/api/stt/stream';
 const DEFAULT_VOICE = 'fil-PH-BlessicaNeural'; // Natural female Filipino voice

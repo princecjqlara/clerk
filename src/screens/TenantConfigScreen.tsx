@@ -1029,7 +1029,7 @@ export default function TenantConfigScreen({ onBack }: Props) {
                     autoListenRef.current = true;
                     setAutoListen(true);
                     try {
-                      const apiKey = tenant?.nvidia_api_key || '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';
+                      const apiKey = tenant?.nvidia_api_key || '';
                       const instructions = [
                         rules ? `RULES:\n${rules}` : '',
                         knowledge ? `KNOWLEDGE BASE:\n${knowledge}` : '',

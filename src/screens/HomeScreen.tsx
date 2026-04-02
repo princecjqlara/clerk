@@ -439,11 +439,7 @@ export default function HomeScreen({ onNavigate }: Props) {
             <TouchableOpacity
               style={[styles.permBtn, { backgroundColor: '#1a2e0a', borderColor: '#76b900' }]}
               onPress={() => {
-                callService.setApiKeys(
-                  '7288b46b415eda427fab877bfd25ce6299bd5f6e',
-                  'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b',
-                  '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'
-                );
+                // Keys loaded from Supabase tenant config — not hardcoded
                 if (Platform.OS === 'web') {
                   window.alert('API keys configured!');
                 } else {

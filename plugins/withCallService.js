@@ -480,9 +480,9 @@ class AudioBridge(
         private const val ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/"
         private const val NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-        var deepgramApiKey: String = "7288b46b415eda427fab877bfd25ce6299bd5f6e"
-        var elevenLabsApiKey: String = "sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b"
-        var nvidiaApiKey: String = "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"
+        var deepgramApiKey: String = ""
+        var elevenLabsApiKey: String = ""
+        var nvidiaApiKey: String = ""
         var elevenLabsVoiceId: String = "EXAVITQu4vr4xnSDxMaL"
         var aiModel: String = "meta/llama-3.3-70b-instruct"
 

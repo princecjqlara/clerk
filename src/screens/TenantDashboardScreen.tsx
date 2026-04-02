@@ -182,11 +182,10 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
   const configureKeys = async () => {
     setDebugMsg('Configuring API keys...');
     try {
-      await callService.setApiKeys(
-        '7288b46b415eda427fab877bfd25ce6299bd5f6e',
-        'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b',
-        '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'
-      );
+      // Keys are loaded from tenant config in Supabase — not hardcoded
+      setDebugMsg('API keys should be configured in tenant settings (Supabase)');
+      setKeysSet(true);
+      return;
       setKeysSet(true);
       setDebugMsg('API keys configured');
     } catch (e: any) {
