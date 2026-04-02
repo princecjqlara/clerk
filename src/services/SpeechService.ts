@@ -5,11 +5,26 @@ import { Platform, NativeModules } from 'react-native';
 const PROXY_BASE = 'http://localhost:3456';
 const TTS_PROXY = `${PROXY_BASE}/api/tts`;
 const ELEVENLABS_TTS_PROXY = `${PROXY_BASE}/api/elevenlabs/tts`;
-const ELEVENLABS_DIRECT_URL = 'https://api.elevenlabs.io/v1/text-to-speech/';
 const ELEVENLABS_API_KEY = 'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b';
 const STT_PROXY = `${PROXY_BASE}/api/stt`;
 const STT_WS = 'ws://localhost:3456/api/stt/stream';
 const DEFAULT_VOICE = 'fil-PH-BlessicaNeural'; // Natural female Filipino voice
+
+// Get the Vercel API endpoint for ElevenLabs TTS (works on deployed web)
+function getElevenLabsProxyUrl(): string {
+  if (typeof window !== 'undefined' && window.location) {
+    return `${window.location.origin}/api/elevenlabs-tts`;
+  }
+  return '/api/elevenlabs-tts';
+}
+
+// Get the welcome message endpoint
+function getWelcomeUrl(tenantId: string): string {
+  if (typeof window !== 'undefined' && window.location && !window.location.hostname.includes('localhost')) {
+    return `${window.location.origin}/api/welcome?tenantId=${tenantId}`;
+  }
+  return `${PROXY_BASE}/api/welcome/${tenantId}/status`;
+}
 
 // TTS provider configuration
 export type TTSProvider = 'edge' | 'elevenlabs';
@@ -45,10 +60,10 @@ export async function speak(text: string, voice: string = DEFAULT_VOICE): Promis
 
   // Try ElevenLabs first if selected
   if (currentTTSProvider === 'elevenlabs') {
-    // Try direct ElevenLabs API first (works on web without proxy)
+    // Use Vercel API route on deployed web, localhost proxy for local dev
+    const ttsUrl = Platform.OS === 'web' ? getElevenLabsProxyUrl() : ELEVENLABS_TTS_PROXY;
     try {
-      const directUrl = `${ELEVENLABS_DIRECT_URL}${currentElevenLabsVoiceId}`;
-      const response = await fetch(directUrl, {
+      const response = await fetch(ttsUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -56,6 +71,7 @@ export async function speak(text: string, voice: string = DEFAULT_VOICE): Promis
         },
         body: JSON.stringify({
           text,
+          voice_id: currentElevenLabsVoiceId,
           model_id: 'eleven_multilingual_v2',
           voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true },
         }),
@@ -73,34 +89,7 @@ export async function speak(text: string, voice: string = DEFAULT_VOICE): Promis
         return;
       }
     } catch {
-      // Direct ElevenLabs failed (CORS or network) — try proxy
-    }
-
-    // Try proxy as fallback
-    try {
-      const response = await fetch(ELEVENLABS_TTS_PROXY, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text,
-          voice_id: currentElevenLabsVoiceId,
-          model_id: 'eleven_multilingual_v2',
-        }),
-      });
-
-      if (response.ok) {
-        const audioBlob = await response.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        if (Platform.OS === 'web') {
-          await playAudioWeb(audioUrl);
-        } else {
-          await playAudioNative(audioUrl);
-        }
-        isSpeaking = false;
-        return;
-      }
-    } catch {
-      // Proxy not available — fall through
+      // TTS proxy failed — fall through to Edge TTS / expo-speech
     }
   }
 
@@ -197,7 +186,8 @@ export async function playWelcomeMessage(tenantId: string = 'default'): Promise<
     // Check if a prerecorded welcome message exists (quick timeout — proxy may not be running)
     const controller = new AbortController();
     const tid = setTimeout(() => controller.abort(), 3000);
-    const statusRes = await fetch(`${PROXY_BASE}/api/welcome/${tenantId}/status`, { signal: controller.signal });
+    const welcomeUrl = getWelcomeUrl(tenantId);
+    const statusRes = await fetch(welcomeUrl, { signal: controller.signal });
     clearTimeout(tid);
     if (!statusRes.ok) return false;
     const status = await statusRes.json();
