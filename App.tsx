@@ -1,7 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { StatusBar } from 'expo-status-bar';
-import { SafeAreaView, StyleSheet, ActivityIndicator, View } from 'react-native';
+import { SafeAreaView, StyleSheet, ActivityIndicator, View, Platform } from 'react-native';
 import { getSession, getCurrentProfile, onAuthStateChange, type UserProfile } from './src/services/AuthService';
+import { callService } from './src/services/CallService';
+import { ConversationManager } from './src/services/ConversationManager';
+import * as Storage from './src/services/StorageService';
 import LoginScreen from './src/screens/LoginScreen';
 import HomeScreen from './src/screens/HomeScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
@@ -16,11 +19,137 @@ import TenantDashboardScreen from './src/screens/TenantDashboardScreen';
 import TenantConfigScreen from './src/screens/TenantConfigScreen';
 import TenantMetricsScreen from './src/screens/TenantMetricsScreen';
 
+// Global call state — shared with TenantDashboardScreen
+interface CallState {
+  isOnCall: boolean;
+  phoneNumber: string;
+  callId: string;
+  flowState: string;
+  listeners: Set<() => void>;
+  update: (patch: Partial<Pick<CallState, 'isOnCall' | 'phoneNumber' | 'callId' | 'flowState'>>) => void;
+}
+
+export const callState: CallState = {
+  isOnCall: false,
+  phoneNumber: '',
+  callId: '',
+  flowState: '',
+  listeners: new Set<() => void>(),
+  update(patch) {
+    Object.assign(callState, patch);
+    callState.listeners.forEach((fn: () => void) => fn());
+  },
+};
+
 export default function App() {
   const [screen, setScreen] = useState('loading');
   const [profile, setProfile] = useState<UserProfile | null>(null);
+  const conversationRef = useRef<ConversationManager | null>(null);
 
   const homeScreen = () => profile?.role === 'admin' ? 'admin-dashboard' : 'tenant-dashboard';
+
+  // Initialize CallService and wire up AI response bridge on Android
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+
+    callService.init();
+
+    // When a call comes in, create a ConversationManager with current tenant config
+    const offIncoming = callService.on('incoming', async (data) => {
+      console.log('[App] Incoming call from', data.phoneNumber);
+      callState.update({ isOnCall: true, phoneNumber: data.phoneNumber, callId: data.callId, flowState: 'ringing' });
+
+      try {
+        const apiKey = await Storage.getApiKey() || '';
+        const businessName = await Storage.getBusinessName() || '';
+        const instructions = await Storage.getCustomInstructions() || '';
+        const callGoal = (await Storage.getCallGoal()) || 'book';
+
+        conversationRef.current = new ConversationManager({
+          apiKey,
+          businessName,
+          callGoal: callGoal as 'book' | 'order',
+          customInstructions: instructions,
+        });
+      } catch (e) {
+        console.error('[App] Failed to init ConversationManager:', e);
+      }
+    });
+
+    const offAnswered = callService.on('answered', () => {
+      callState.update({ flowState: 'answered' });
+    });
+
+    // Native AudioBridge requests an AI greeting
+    const offGreeting = callService.on('requestGreeting', async () => {
+      console.log('[App] Greeting requested by AudioBridge');
+      callState.update({ flowState: 'greeting' });
+      try {
+        const mgr = conversationRef.current;
+        if (mgr) {
+          const greeting = await mgr.getGreeting();
+          await callService.supplyAIResponse(greeting);
+        }
+      } catch (e) {
+        console.error('[App] Greeting generation failed:', e);
+      }
+    });
+
+    // Native AudioBridge requests an AI response to caller speech
+    const offAIRequest = callService.on('requestAIResponse', async (data) => {
+      console.log('[App] AI response requested for:', data.text);
+      callState.update({ flowState: 'thinking' });
+      try {
+        const mgr = conversationRef.current;
+        if (mgr) {
+          const response = await mgr.respond(data.text);
+          await callService.supplyAIResponse(response);
+        }
+      } catch (e) {
+        console.error('[App] AI response failed:', e);
+      }
+    });
+
+    // Track call flow state
+    const offFlow = callService.on('callFlowUpdate', (data) => {
+      callState.update({ flowState: data.state });
+    });
+
+    // Call ended — save transcript and clean up
+    const offDisconnected = callService.on('disconnected', async (data) => {
+      console.log('[App] Call disconnected:', data.phoneNumber, 'duration:', data.duration);
+      callState.update({ isOnCall: false, phoneNumber: '', callId: '', flowState: '' });
+
+      try {
+        const mgr = conversationRef.current;
+        if (mgr) {
+          const transcript = mgr.getTranscript();
+          const callRecord = {
+            id: Date.now().toString(),
+            phoneNumber: data.phoneNumber || 'Unknown',
+            timestamp: Date.now(),
+            duration: parseInt(data.duration || '0', 10),
+            transcript,
+            callGoal: mgr.getGoal(),
+          };
+          await Storage.addCallRecord(callRecord);
+        }
+      } catch (e) {
+        console.error('[App] Failed to save call record:', e);
+      }
+      conversationRef.current = null;
+    });
+
+    return () => {
+      offIncoming();
+      offAnswered();
+      offGreeting();
+      offAIRequest();
+      offFlow();
+      offDisconnected();
+      callService.destroy();
+    };
+  }, []);
 
   useEffect(() => {
     let initialized = false;

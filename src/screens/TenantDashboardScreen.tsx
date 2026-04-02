@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import {
-  View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Modal, RefreshControl, Platform, Switch, Alert,
+  View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Modal, RefreshControl, Platform, Switch, Alert, NativeModules,
 } from 'react-native';
 import { supabaseAdmin } from '../services/SupabaseClient';
 import { signOut, getCurrentProfile } from '../services/AuthService';
 import { callService } from '../services/CallService';
 import * as Storage from '../services/StorageService';
+import { callState } from '../../App';
 
 interface CallLogEntry {
   id: string;
@@ -34,35 +35,92 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
   const [permsGranted, setPermsGranted] = useState(false);
   const [dialerSet, setDialerSet] = useState(false);
   const [keysSet, setKeysSet] = useState(false);
+  const [debugMsg, setDebugMsg] = useState('');
+  const [isOnCall, setIsOnCall] = useState(callState.isOnCall);
+  const [callPhone, setCallPhone] = useState(callState.phoneNumber);
+  const [callFlow, setCallFlow] = useState(callState.flowState);
 
   useEffect(() => {
+    // Debug: check if native module is available
+    const mod = NativeModules.AICallModule;
+    setDebugMsg(`Platform: ${Platform.OS} | AICallModule: ${mod ? 'LOADED' : 'NULL'} | Methods: ${mod ? Object.keys(mod).join(', ') : 'none'}`);
+
     Storage.getEnabled().then(setAiEnabled).catch(() => {});
     // Auto-check permissions on load
     callService.checkPermissions().then(setPermsGranted).catch(() => {});
     callService.checkDefaultDialer().then(setDialerSet).catch(() => {});
   }, []);
 
+  // Subscribe to live call state changes
+  useEffect(() => {
+    const listener = () => {
+      setIsOnCall(callState.isOnCall);
+      setCallPhone(callState.phoneNumber);
+      setCallFlow(callState.flowState);
+    };
+    callState.listeners.add(listener);
+    return () => { callState.listeners.delete(listener); };
+  }, []);
+
   const toggleAI = async (value: boolean) => {
-    await Storage.setEnabled(value);
-    await callService.setEnabled(value);
-    setAiEnabled(value);
+    try {
+      await Storage.setEnabled(value);
+      await callService.setEnabled(value);
+      setAiEnabled(value);
+      setDebugMsg(value ? 'AI enabled — service starting...' : 'AI disabled');
+    } catch (e: any) {
+      setDebugMsg(`Toggle error: ${e?.message || e}`);
+    }
   };
 
   const requestPerms = async () => {
+    setDebugMsg('Requesting permissions...');
     try {
-      const granted = await callService.requestPermissions();
-      setPermsGranted(granted);
-    } catch {}
+      await callService.requestPermissions();
+      // Poll for result — the system permission dialog takes time
+      let checks = 0;
+      const poll = setInterval(async () => {
+        checks++;
+        const granted = await callService.checkPermissions();
+        setDebugMsg(`Permission check #${checks}: ${granted}`);
+        if (granted) {
+          setPermsGranted(true);
+          clearInterval(poll);
+        } else if (checks >= 15) {
+          setDebugMsg('Permissions not granted yet — tap the button again if dialog was dismissed');
+          clearInterval(poll);
+        }
+      }, 1000);
+    } catch (e: any) {
+      setDebugMsg(`Permissions error: ${e?.message || e}`);
+    }
   };
 
   const requestDialer = async () => {
+    setDebugMsg('Opening default dialer dialog...');
     try {
       await callService.requestDefaultDialer();
-      setDialerSet(true);
-    } catch {}
+      setDebugMsg('Tap ACCEPT on the system dialog. Checking...');
+      let checks = 0;
+      const poll = setInterval(async () => {
+        checks++;
+        const actual = await callService.checkDefaultDialer();
+        if (actual) {
+          setDialerSet(true);
+          setDebugMsg('Default dialer set! You can now enable AI.');
+          clearInterval(poll);
+        } else if (checks >= 60) {
+          setDebugMsg('Still not set. Try: Settings > Apps > Default apps > Phone > AI Receptionist');
+          clearInterval(poll);
+        }
+      }, 1000);
+    } catch (e: any) {
+      setDebugMsg(`Dialer error: ${e?.message || e}`);
+    }
   };
 
   const configureKeys = async () => {
+    setDebugMsg('Configuring API keys...');
     try {
       await callService.setApiKeys(
         '7288b46b415eda427fab877bfd25ce6299bd5f6e',
@@ -70,7 +128,10 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
         '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'
       );
       setKeysSet(true);
-    } catch {}
+      setDebugMsg('API keys configured');
+    } catch (e: any) {
+      setDebugMsg(`Keys error: ${e?.message || e}`);
+    }
   };
 
   const loadData = async () => {
@@ -187,6 +248,36 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
           </TouchableOpacity>
         </View>
 
+        {/* Live Call Status */}
+        {isOnCall ? (
+          <View style={styles.callBanner}>
+            <View style={styles.callBannerDot} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.callBannerTitle}>On Call — {callPhone || 'Unknown'}</Text>
+              <Text style={styles.callBannerSub}>
+                {callFlow === 'ringing' ? 'Ringing...' :
+                 callFlow === 'answered' ? 'Connected' :
+                 callFlow === 'starting' ? 'Starting AI...' :
+                 callFlow === 'greeting' ? 'Playing greeting...' :
+                 callFlow === 'listening' ? 'Listening to caller...' :
+                 callFlow === 'recording' ? 'Recording...' :
+                 callFlow === 'transcribing' ? 'Transcribing speech...' :
+                 callFlow === 'thinking' ? 'AI is thinking...' :
+                 callFlow === 'calling_ai' ? 'Calling NVIDIA AI...' :
+                 callFlow === 'ai_failed' ? 'AI failed, retrying...' :
+                 callFlow === 'speaking' ? 'AI is speaking...' :
+                 callFlow === 'playing_welcome' ? 'Playing welcome...' :
+                 callFlow === 'error' ? 'Error occurred' :
+                 callFlow || 'Active'}
+              </Text>
+            </View>
+          </View>
+        ) : (
+          <View style={styles.callBannerIdle}>
+            <Text style={styles.callBannerIdleText}>Not on a call</Text>
+          </View>
+        )}
+
         {/* Stats */}
         <View style={styles.statsRow}>
           <View style={styles.statCard}>
@@ -238,9 +329,15 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
                 onPress={requestDialer}
               >
                 <Text style={styles.setupBtnText}>
-                  {dialerSet ? '\u2713  Default Dialer Set' : '2. Set as Default Phone App'}
+                  {dialerSet ? '\u2713  Default Phone App Set' : '2. Set as Default Phone App (REQUIRED)'}
                 </Text>
               </TouchableOpacity>
+
+              {!dialerSet && (
+                <Text style={{ fontSize: 11, color: '#ff9800', marginHorizontal: 8, marginBottom: 8, lineHeight: 16 }}>
+                  The app MUST be default phone app to answer calls and play AI voice. Tap ACCEPT on the dialog that appears.
+                </Text>
+              )}
 
               <TouchableOpacity
                 style={[styles.setupBtn, keysSet && styles.setupBtnDone]}
@@ -254,8 +351,23 @@ export default function TenantDashboardScreen({ onLogout, onNavigate }: Props) {
               {permsGranted && dialerSet && keysSet && (
                 <Text style={styles.setupReady}>All set! Enable the toggle above to start.</Text>
               )}
+
+              {debugMsg ? (
+                <View style={{ marginTop: 8, backgroundColor: '#111', borderRadius: 8, padding: 10 }}>
+                  <Text style={{ fontSize: 11, color: '#ff9800', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' }}>{debugMsg}</Text>
+                </View>
+              ) : null}
             </View>
           )}
+
+          {/* Debug panel — always visible */}
+          {(aiEnabled && (debugMsg || callFlow)) ? (
+            <View style={{ marginTop: 8, backgroundColor: '#111', borderRadius: 8, padding: 10 }}>
+              <Text style={{ fontSize: 11, color: '#ff9800', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' }}>
+                {callFlow ? `Flow: ${callFlow}` : ''}{debugMsg ? `\n${debugMsg}` : ''}
+              </Text>
+            </View>
+          ) : null}
         </View>
 
         {/* Quick Actions */}
@@ -439,6 +551,24 @@ const styles = StyleSheet.create({
   subtitle: { fontSize: 13, color: '#76b900', marginTop: 2 },
   logoutBtn: { backgroundColor: '#1a1a1a', borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, borderWidth: 1, borderColor: '#333' },
   logoutText: { color: '#f44336', fontSize: 13, fontWeight: '600' },
+
+  callBanner: {
+    flexDirection: 'row', alignItems: 'center', marginHorizontal: 16, marginBottom: 16,
+    backgroundColor: '#1a2e0a', borderRadius: 12, padding: 14,
+    borderWidth: 1, borderColor: '#76b900',
+  },
+  callBannerDot: {
+    width: 12, height: 12, borderRadius: 6, backgroundColor: '#76b900',
+    marginRight: 12,
+  },
+  callBannerTitle: { fontSize: 15, fontWeight: '700', color: '#76b900' },
+  callBannerSub: { fontSize: 12, color: '#aaa', marginTop: 2 },
+  callBannerIdle: {
+    marginHorizontal: 16, marginBottom: 16, backgroundColor: '#1a1a1a',
+    borderRadius: 12, padding: 12, alignItems: 'center',
+    borderWidth: 1, borderColor: '#222',
+  },
+  callBannerIdleText: { fontSize: 13, color: '#555' },
 
   statsRow: { flexDirection: 'row', paddingHorizontal: 16, gap: 10, marginBottom: 20 },
   statCard: { flex: 1, backgroundColor: '#1a1a1a', borderRadius: 12, padding: 14, alignItems: 'center', borderWidth: 1, borderColor: '#222' },

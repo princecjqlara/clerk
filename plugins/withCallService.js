@@ -36,6 +36,41 @@ function addPermissions(androidManifest) {
   return androidManifest;
 }
 
+function addDialerIntentFilters(androidManifest) {
+  const app = androidManifest.manifest.application[0];
+  if (!app.activity) app.activity = [];
+
+  // Find MainActivity and add ACTION_DIAL intent filter (required to be eligible as default dialer)
+  const mainActivity = app.activity.find(
+    (a) => a.$?.['android:name'] === '.MainActivity'
+  );
+  if (mainActivity) {
+    if (!mainActivity['intent-filter']) mainActivity['intent-filter'] = [];
+
+    // Add ACTION_DIAL intent filter
+    const hasDialFilter = mainActivity['intent-filter'].some((f) =>
+      f.action?.some((a) => a.$?.['android:name'] === 'android.intent.action.DIAL')
+    );
+    if (!hasDialFilter) {
+      mainActivity['intent-filter'].push({
+        action: [{ $: { 'android:name': 'android.intent.action.DIAL' } }],
+        category: [{ $: { 'android:name': 'android.intent.category.DEFAULT' } }],
+      });
+      mainActivity['intent-filter'].push({
+        action: [{ $: { 'android:name': 'android.intent.action.DIAL' } }],
+        category: [{ $: { 'android:name': 'android.intent.category.DEFAULT' } }],
+        data: [{ $: { 'android:scheme': 'tel' } }],
+      });
+      mainActivity['intent-filter'].push({
+        action: [{ $: { 'android:name': 'android.intent.action.CALL_BUTTON' } }],
+        category: [{ $: { 'android:name': 'android.intent.category.DEFAULT' } }],
+      });
+    }
+  }
+
+  return androidManifest;
+}
+
 function addServices(androidManifest) {
   const app = androidManifest.manifest.application[0];
   if (!app.service) app.service = [];
@@ -94,6 +129,7 @@ function withCallServiceManifest(config) {
   return withAndroidManifest(config, (config) => {
     config.modResults = addPermissions(config.modResults);
     config.modResults = addServices(config.modResults);
+    config.modResults = addDialerIntentFilters(config.modResults);
     return config;
   });
 }
@@ -299,25 +335,32 @@ class AIInCallService : InCallService() {
     }
 
     private fun setupAudioForCall() {
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        // Keep speakerphone OFF so TTS goes through earpiece/call audio to caller
-        audioManager.isSpeakerphoneOn = false
-    }
+         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+         // Enable speakerphone so USAGE_VOICE_COMMUNICATION AudioTrack output
+         // routes through the telephony uplink to the remote caller.
+         // Without this, TTS audio only plays locally through earpiece and
+         // the remote caller hears nothing.
+         audioManager.isSpeakerphoneOn = true
+         Log.d(TAG, "Audio setup: MODE_IN_COMMUNICATION, speakerphone=ON")
+     }
 
-    private fun startAIConversation(callId: String, phoneNumber: String) {
-        Log.d(TAG, "Starting AI conversation for call $callId from $phoneNumber")
+     private fun startAIConversation(callId: String, phoneNumber: String) {
+         Log.d(TAG, "Starting AI conversation for call $callId from $phoneNumber")
 
-        audioBridge = AudioBridge(this) { event, data ->
-            // Forward AudioBridge events to JS via AICallModule
-            val eventData = data.toMutableMap()
-            eventData["callId"] = callId
-            eventData["phoneNumber"] = phoneNumber
-            AICallModule.sendEvent(event, eventData)
-        }
+         audioBridge = AudioBridge(this) { event, data ->
+             // Forward AudioBridge events to JS via AICallModule
+             val eventData = data.toMutableMap()
+             eventData["callId"] = callId
+             eventData["phoneNumber"] = phoneNumber
+             AICallModule.sendEvent(event, eventData)
+         }
 
-        audioBridge?.start()
-    }
+         // Delay start to let audio system settle after call connection
+         handler.postDelayed({
+             audioBridge?.start()
+         }, 500)
+     }
 
     private fun stopAIConversation() {
         Log.d(TAG, "Stopping AI conversation")
@@ -648,33 +691,51 @@ class AudioBridge(
     // ===================== VOICE RECORDING =====================
 
     private fun recordCallerSpeech(): ByteArray? {
-        val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
-        if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
-            Log.e(TAG, "Invalid AudioRecord buffer size")
-            return null
-        }
+         val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
+         if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
+             Log.e(TAG, "Invalid AudioRecord buffer size")
+             return null
+         }
 
-        val bufferSize = maxOf(minBufferSize * 2, SAMPLE_RATE * 2) // At least 1 second buffer
+         val bufferSize = maxOf(minBufferSize * 2, SAMPLE_RATE * 2) // At least 1 second buffer
 
-        try {
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                SAMPLE_RATE,
-                CHANNEL_CONFIG,
-                AUDIO_FORMAT,
-                bufferSize
-            )
+         try {
+             // Try VOICE_COMMUNICATION first (captures call audio on most devices)
+             // Fall back to MIC if it fails (some devices/ROMs don't support VOICE_COMMUNICATION)
+             val audioSources = listOf(
+                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                 MediaRecorder.AudioSource.MIC,
+                 MediaRecorder.AudioSource.DEFAULT
+             )
 
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord failed to initialize")
-                audioRecord?.release()
-                audioRecord = null
-                return null
-            }
-        } catch (e: SecurityException) {
-            Log.e(TAG, "RECORD_AUDIO permission not granted", e)
-            return null
-        }
+             for (source in audioSources) {
+                 try {
+                     audioRecord = AudioRecord(source, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
+                     if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
+                         Log.d(TAG, "AudioRecord initialized with source: $source")
+                         break
+                     } else {
+                         Log.w(TAG, "AudioRecord failed to init with source $source, trying next")
+                         audioRecord?.release()
+                         audioRecord = null
+                     }
+                 } catch (e: Exception) {
+                     Log.w(TAG, "AudioRecord source $source threw: \${e.message}")
+                     audioRecord?.release()
+                     audioRecord = null
+                 }
+             }
+
+             if (audioRecord == null || audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                 Log.e(TAG, "AudioRecord failed to initialize with any audio source")
+                 audioRecord?.release()
+                 audioRecord = null
+                 return null
+             }
+         } catch (e: SecurityException) {
+             Log.e(TAG, "RECORD_AUDIO permission not granted", e)
+             return null
+         }
 
         recordedAudio.reset()
         hasSpeechStarted = false
@@ -891,15 +952,14 @@ class AudioBridge(
 
     private fun fetchElevenLabsTTS(text: String): ByteArray? {
         try {
-            // Call ElevenLabs API directly
-            val url = URL("$ELEVENLABS_TTS_URL$elevenLabsVoiceId")
+            // Call ElevenLabs API directly — request raw PCM at 16kHz to match our AudioTrack
+            val url = URL("$ELEVENLABS_TTS_URL$elevenLabsVoiceId?output_format=pcm_16000")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("xi-api-key", elevenLabsApiKey)
-            conn.setRequestProperty("Accept", "audio/mpeg")
-            conn.connectTimeout = 10000
+            conn.connectTimeout = 15000
             conn.readTimeout = 30000
 
             val json = org.json.JSONObject()
@@ -923,7 +983,7 @@ class AudioBridge(
 
             val audioBytes = conn.inputStream.readBytes()
             conn.disconnect()
-            Log.d(TAG, "ElevenLabs TTS received \${audioBytes.size} bytes")
+            Log.d(TAG, "ElevenLabs TTS received \${audioBytes.size} bytes (raw PCM 16kHz)")
             return audioBytes
         } catch (e: Exception) {
             Log.w(TAG, "ElevenLabs TTS error: \${e.message}")
@@ -932,152 +992,200 @@ class AudioBridge(
     }
 
     /**
-     * Plays audio bytes to the call using AudioTrack with USAGE_VOICE_COMMUNICATION.
-     * This routes the audio through the telephony audio path so the remote caller hears it,
-     * while the local device stays silent (no speaker output).
-     *
-     * Supports raw PCM and common audio container formats (the proxy returns mp3/wav/ogg).
-     * For non-PCM formats, we decode first using Android's MediaCodec/MediaExtractor.
-     */
-    private fun playAudioToCall(audioBytes: ByteArray) {
-        try {
-            // Try to decode the audio (could be mp3, wav, ogg from TTS proxy)
-            val pcmData = decodeAudioToPCM(audioBytes)
-            if (pcmData == null || pcmData.isEmpty()) {
-                Log.w(TAG, "Failed to decode audio to PCM")
-                return
-            }
+      * Plays audio bytes to the call using AudioTrack with USAGE_VOICE_COMMUNICATION.
+      * This routes the audio through the telephony audio path so the remote caller hears it.
+      *
+      * Since we request pcm_16000 from ElevenLabs, audioBytes is already raw PCM 16kHz mono 16-bit.
+      * For other formats (WAV, MP3), we decode first.
+      */
+     private fun playAudioToCall(audioBytes: ByteArray) {
+         try {
+             val pcmData = decodeAudioToPCM(audioBytes)
+             if (pcmData == null || pcmData.isEmpty()) {
+                 Log.w(TAG, "Failed to decode audio to PCM, size=\${audioBytes.size}")
+                 return
+             }
 
-            val audioAttributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
+             Log.d(TAG, "Playing \${pcmData.size} bytes of PCM audio to call")
 
-            val audioFormat = AudioFormat.Builder()
-                .setSampleRate(SAMPLE_RATE)
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                .build()
+             val audioAttributes = AudioAttributes.Builder()
+                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                 .build()
 
-            val minBuffer = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
+             val audioFormat = AudioFormat.Builder()
+                 .setSampleRate(SAMPLE_RATE)
+                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                 .build()
 
-            audioTrack = AudioTrack.Builder()
-                .setAudioAttributes(audioAttributes)
-                .setAudioFormat(audioFormat)
-                .setBufferSizeInBytes(maxOf(minBuffer, pcmData.size))
-                .setTransferMode(AudioTrack.MODE_STATIC)
-                .build()
+             val minBuffer = AudioTrack.getMinBufferSize(
+                 SAMPLE_RATE,
+                 AudioFormat.CHANNEL_OUT_MONO,
+                 AudioFormat.ENCODING_PCM_16BIT
+             )
 
-            audioTrack?.write(pcmData, 0, pcmData.size)
-            audioTrack?.play()
+             // Use MODE_STREAM instead of MODE_STATIC — more reliable for large audio buffers
+             audioTrack = AudioTrack.Builder()
+                 .setAudioAttributes(audioAttributes)
+                 .setAudioFormat(audioFormat)
+                 .setBufferSizeInBytes(maxOf(minBuffer * 2, 4096))
+                 .setTransferMode(AudioTrack.MODE_STREAM)
+                 .build()
 
-            // Wait for playback to complete
-            val durationMs = (pcmData.size.toLong() * 1000) / (SAMPLE_RATE * 2) // 16-bit = 2 bytes per sample
-            Thread.sleep(durationMs + 200) // Small buffer
+             if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+                 Log.e(TAG, "AudioTrack failed to initialize")
+                 stopPlayback()
+                 return
+             }
 
-            stopPlayback()
-        } catch (e: Exception) {
-            Log.e(TAG, "Audio playback error", e)
-            stopPlayback()
-        }
-    }
+             audioTrack?.play()
+
+             // Write in chunks for MODE_STREAM
+             var offset = 0
+             val chunkSize = minBuffer
+             while (offset < pcmData.size && isRunning) {
+                 val remaining = pcmData.size - offset
+                 val writeSize = minOf(chunkSize, remaining)
+                 val written = audioTrack?.write(pcmData, offset, writeSize) ?: -1
+                 if (written < 0) {
+                     Log.e(TAG, "AudioTrack write error: $written")
+                     break
+                 }
+                 offset += written
+             }
+
+             // Wait for the last chunk to finish playing
+             val durationMs = (pcmData.size.toLong() * 1000) / (SAMPLE_RATE * 2)
+             val remainingMs = durationMs - (offset.toLong() * 1000) / (SAMPLE_RATE * 2)
+             if (remainingMs > 0) {
+                 Thread.sleep(remainingMs + 300)
+             } else {
+                 Thread.sleep(500) // Small buffer to ensure playback completes
+             }
+
+             stopPlayback()
+         } catch (e: Exception) {
+             Log.e(TAG, "Audio playback error: \${e.message}", e)
+             stopPlayback()
+         }
+     }
 
     /**
-     * Decodes audio bytes (mp3, wav, ogg, etc.) into raw PCM 16kHz mono 16-bit.
-     * Uses Android's MediaExtractor and MediaCodec.
-     */
-    private fun decodeAudioToPCM(audioBytes: ByteArray): ByteArray? {
-        try {
-            // Check if this is already raw PCM (no header magic bytes)
-            // WAV files start with "RIFF", MP3 with 0xFF 0xFB, OGG with "OggS"
-            val isWav = audioBytes.size > 44 &&
-                audioBytes[0] == 'R'.code.toByte() && audioBytes[1] == 'I'.code.toByte() &&
-                audioBytes[2] == 'F'.code.toByte() && audioBytes[3] == 'F'.code.toByte()
+      * Decodes audio bytes into raw PCM 16kHz mono 16-bit.
+      * Handles: raw PCM (from ElevenLabs pcm_16000), WAV, MP3, OGG.
+      */
+     private fun decodeAudioToPCM(audioBytes: ByteArray): ByteArray? {
+         try {
+             if (audioBytes.isEmpty()) return null
 
-            if (isWav) {
-                // Extract PCM data from WAV (skip 44-byte header) and resample if needed
-                val pcm = audioBytes.copyOfRange(44, audioBytes.size)
-                return pcm
-            }
+             // Detect format by magic bytes
+             val isWav = audioBytes.size > 44 &&
+                 audioBytes[0] == 'R'.code.toByte() && audioBytes[1] == 'I'.code.toByte() &&
+                 audioBytes[2] == 'F'.code.toByte() && audioBytes[3] == 'F'.code.toByte()
 
-            // For other formats (mp3, ogg), use MediaCodec to decode
-            val tempFile = java.io.File(context.cacheDir, "tts_temp_\${System.currentTimeMillis()}.audio")
-            tempFile.writeBytes(audioBytes)
+             val isMp3 = audioBytes.size > 2 &&
+                 (audioBytes[0].toInt() and 0xFF) == 0xFF &&
+                 (audioBytes[1].toInt() and 0xE0) == 0xE0
 
-            try {
-                val extractor = MediaExtractor()
-                extractor.setDataSource(tempFile.absolutePath)
+             val isOgg = audioBytes.size > 4 &&
+                 audioBytes[0] == 'O'.code.toByte() && audioBytes[1] == 'g'.code.toByte() &&
+                 audioBytes[2] == 'g'.code.toByte() && audioBytes[3] == 'S'.code.toByte()
 
-                if (extractor.trackCount == 0) {
-                    extractor.release()
-                    return null
-                }
+             if (isWav) {
+                 Log.d(TAG, "Detected WAV format, extracting PCM data")
+                 val pcm = audioBytes.copyOfRange(44, audioBytes.size)
+                 return pcm
+             }
 
-                extractor.selectTrack(0)
-                val format = extractor.getTrackFormat(0)
-                val mime = format.getString(MediaFormat.KEY_MIME) ?: return null
+             if (!isMp3 && !isOgg) {
+                 // No recognized header — assume raw PCM (ElevenLabs pcm_16000 output)
+                 Log.d(TAG, "No audio header detected, treating as raw PCM 16kHz (\${audioBytes.size} bytes)")
+                 return audioBytes
+             }
 
-                val codec = MediaCodec.createDecoderByType(mime)
-                val outputFormat = MediaFormat.createAudioFormat(
-                    MediaFormat.MIMETYPE_AUDIO_RAW, SAMPLE_RATE, 1
-                )
-                codec.configure(format, null, null, 0)
-                codec.start()
+             // For MP3/OGG, use MediaCodec to decode
+             Log.d(TAG, "Detected encoded audio format, decoding via MediaCodec")
+             val tempFile = java.io.File(context.cacheDir, "tts_temp_\${System.currentTimeMillis()}.audio")
+             tempFile.writeBytes(audioBytes)
 
-                val output = ByteArrayOutputStream()
-                val bufferInfo = MediaCodec.BufferInfo()
-                var inputDone = false
-                var outputDone = false
+             try {
+                 val extractor = MediaExtractor()
+                 extractor.setDataSource(tempFile.absolutePath)
 
-                while (!outputDone && isRunning) {
-                    // Feed input
-                    if (!inputDone) {
-                        val inputIdx = codec.dequeueInputBuffer(10000)
-                        if (inputIdx >= 0) {
-                            val inputBuffer = codec.getInputBuffer(inputIdx)!!
-                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                            if (sampleSize < 0) {
-                                codec.queueInputBuffer(inputIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                inputDone = true
-                            } else {
-                                codec.queueInputBuffer(inputIdx, 0, sampleSize, extractor.sampleTime, 0)
-                                extractor.advance()
-                            }
-                        }
-                    }
+                 if (extractor.trackCount == 0) {
+                     Log.w(TAG, "MediaExtractor found no tracks")
+                     extractor.release()
+                     // Fall back to treating as raw PCM
+                     return audioBytes
+                 }
 
-                    // Drain output
-                    val outputIdx = codec.dequeueOutputBuffer(bufferInfo, 10000)
-                    if (outputIdx >= 0) {
-                        val outputBuffer = codec.getOutputBuffer(outputIdx)!!
-                        val pcmChunk = ByteArray(bufferInfo.size)
-                        outputBuffer.get(pcmChunk)
-                        output.write(pcmChunk)
-                        codec.releaseOutputBuffer(outputIdx, false)
+                 extractor.selectTrack(0)
+                 val format = extractor.getTrackFormat(0)
+                 val mime = format.getString(MediaFormat.KEY_MIME)
+                 if (mime == null) {
+                     extractor.release()
+                     return audioBytes
+                 }
 
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                            outputDone = true
-                        }
-                    }
-                }
+                 Log.d(TAG, "Decoding audio: mime=$mime")
+                 val codec = MediaCodec.createDecoderByType(mime)
+                 codec.configure(format, null, null, 0)
+                 codec.start()
 
-                codec.stop()
-                codec.release()
-                extractor.release()
+                 val output = ByteArrayOutputStream()
+                 val bufferInfo = MediaCodec.BufferInfo()
+                 var inputDone = false
+                 var outputDone = false
 
-                return output.toByteArray()
-            } finally {
-                tempFile.delete()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Audio decode error", e)
-            return null
-        }
-    }
+                 while (!outputDone && isRunning) {
+                     // Feed input
+                     if (!inputDone) {
+                         val inputIdx = codec.dequeueInputBuffer(10000)
+                         if (inputIdx >= 0) {
+                             val inputBuffer = codec.getInputBuffer(inputIdx)!!
+                             val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                             if (sampleSize < 0) {
+                                 codec.queueInputBuffer(inputIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                 inputDone = true
+                             } else {
+                                 codec.queueInputBuffer(inputIdx, 0, sampleSize, extractor.sampleTime, 0)
+                                 extractor.advance()
+                             }
+                         }
+                     }
+
+                     // Drain output
+                     val outputIdx = codec.dequeueOutputBuffer(bufferInfo, 10000)
+                     if (outputIdx >= 0) {
+                         val outputBuffer = codec.getOutputBuffer(outputIdx)!!
+                         val pcmChunk = ByteArray(bufferInfo.size)
+                         outputBuffer.get(pcmChunk)
+                         output.write(pcmChunk)
+                         codec.releaseOutputBuffer(outputIdx, false)
+
+                         if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                             outputDone = true
+                         }
+                     }
+                 }
+
+                 codec.stop()
+                 codec.release()
+                 extractor.release()
+
+                 val decoded = output.toByteArray()
+                 Log.d(TAG, "Decoded \${audioBytes.size} bytes -> \${decoded.size} bytes PCM")
+                 return decoded
+             } finally {
+                 tempFile.delete()
+             }
+         } catch (e: Exception) {
+             Log.e(TAG, "Audio decode error: \${e.message}", e)
+             // Last resort: return raw bytes and hope for the best
+             return audioBytes
+         }
+     }
 
     private fun stopPlayback() {
         try {

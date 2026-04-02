@@ -37,7 +37,17 @@
       "Bash(npx vercel:*)",
       "Bash(vercel --prod --yes)",
       "Bash(./gradlew assembleRelease)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(du -sh /c/Users/bigcl/Downloads/aireceptionist/*)",
+      "Bash(npx tsc:*)",
+      "Bash(ipconfig)",
+      "Bash(npx serve:*)",
+      "Bash(npx http-server:*)",
+      "Bash(fuser -k 8099/tcp)",
+      "Bash(fuser -k 8100/tcp)",
+      "Bash(keytool:*)",
+      "Bash(xxd)",
+      "Bash(./gradlew clean:*)"
     ]
   }
 }
