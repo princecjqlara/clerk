@@ -95,7 +95,9 @@ export default function TestScreen({ onBack }: Props) {
         customInstructions,
       });
 
-      const greeting = await convoRef.current.getGreeting();
+      const greeting = await convoRef.current.getGreeting((partial) => {
+        setMessages([{ role: 'ai', text: partial }]);
+      });
       setMessages([{ role: 'ai', text: greeting }]);
 
       // Try prerecorded welcome first, fall back to TTS
@@ -127,8 +129,12 @@ export default function TestScreen({ onBack }: Props) {
     setLoading(true);
 
     try {
-      const response = await convoRef.current.respond(userText);
-      setMessages((prev) => [...prev, { role: 'ai', text: response }]);
+      // Add streaming placeholder
+      setMessages((prev) => [...prev, { role: 'ai', text: '...' }]);
+      const response = await convoRef.current.respond(userText, (partial) => {
+        setMessages((prev) => [...prev.slice(0, -1), { role: 'ai', text: partial }]);
+      });
+      setMessages((prev) => [...prev.slice(0, -1), { role: 'ai', text: response }]);
       speak(response);
     } catch (err: any) {
       setMessages((prev) => [...prev, { role: 'ai', text: `Error: ${err.message}` }]);

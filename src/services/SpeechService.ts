@@ -2,35 +2,126 @@ import * as ExpoSpeech from 'expo-speech';
 import { Audio } from 'expo-av';
 import { Platform, NativeModules } from 'react-native';
 
-const PROXY_BASE = 'http://localhost:3456';
-const TTS_PROXY = `${PROXY_BASE}/api/tts`;
-const ELEVENLABS_TTS_PROXY = `${PROXY_BASE}/api/elevenlabs/tts`;
-const ELEVENLABS_API_KEY = '';
-const STT_PROXY = `${PROXY_BASE}/api/stt`;
-const STT_WS = 'ws://localhost:3456/api/stt/stream';
-const DEFAULT_VOICE = 'fil-PH-BlessicaNeural'; // Natural female Filipino voice
+import { getApiBase } from './ApiBase';
 
-// Get the Vercel API endpoint for ElevenLabs TTS (works on deployed web)
-function getElevenLabsProxyUrl(): string {
-  if (typeof window !== 'undefined' && window.location) {
-    return `${window.location.origin}/api/elevenlabs-tts`;
-  }
-  return '/api/elevenlabs-tts';
+const DEFAULT_VOICE = 'fil-PH-BlessicaNeural'; // Natural female Filipino voice — Taglish/Tagalog/English
+const ELEVENLABS_DEFAULT_KEY = 'sk_738f0122aa988e8f154b8ba46598301cc61787b3a0ee894b';
+const ELEVENLABS_DIRECT_URL = 'https://api.elevenlabs.io/v1/text-to-speech';
+
+// Microsoft Edge TTS — free, no API key, excellent Filipino neural voices
+const EDGE_TTS_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
+const EDGE_TTS_WS = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${EDGE_TTS_TOKEN}`;
+
+function getProxyBase(): string {
+  return getApiBase();
+}
+
+function generateId(): string {
+  return 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'.replace(/x/g, () =>
+    Math.floor(Math.random() * 16).toString(16)
+  );
+}
+
+function escapeSSML(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Direct Edge TTS via Microsoft WebSocket — works everywhere, no proxy needed
+async function edgeTTSDirect(text: string, voice: string): Promise<Blob | null> {
+  if (typeof WebSocket === 'undefined') return null;
+
+  return new Promise((resolve) => {
+    const connectionId = generateId();
+    const requestId = generateId();
+    const wsUrl = `${EDGE_TTS_WS}&ConnectionId=${connectionId}`;
+
+    console.log('[EdgeTTS] Connecting to Microsoft WebSocket...');
+    const ws = new WebSocket(wsUrl);
+    if (ws.binaryType !== undefined) ws.binaryType = 'arraybuffer';
+
+    const audioChunks: ArrayBuffer[] = [];
+    let resolved = false;
+
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        console.warn('[EdgeTTS] Timeout after 15s');
+        resolved = true;
+        ws.close();
+        resolve(null);
+      }
+    }, 15000);
+
+    const done = (success: boolean) => {
+      if (resolved) return;
+      clearTimeout(timeout);
+      resolved = true;
+      ws.close();
+      if (success && audioChunks.length > 0) {
+        console.log('[EdgeTTS] Got', audioChunks.length, 'audio chunks');
+        resolve(new Blob(audioChunks, { type: 'audio/mp3' }));
+      } else {
+        resolve(null);
+      }
+    };
+
+    ws.onopen = () => {
+      console.log('[EdgeTTS] Connected — sending SSML with voice:', voice);
+      // Send output format config
+      ws.send(
+        `Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
+        `{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}`
+      );
+
+      // Send SSML synthesis request
+      const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>` +
+        `<voice name='${voice}'>` +
+        `<prosody pitch='+0Hz' rate='+0%' volume='+0%'>${escapeSSML(text)}</prosody>` +
+        `</voice></speak>`;
+
+      ws.send(
+        `X-RequestId:${requestId}\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n${ssml}`
+      );
+    };
+
+    ws.onmessage = (event: any) => {
+      if (typeof event.data === 'string') {
+        if (event.data.includes('Path:turn.end')) {
+          done(true);
+        }
+      } else if (event.data instanceof ArrayBuffer) {
+        // Binary: 2-byte header length (big-endian) + text header + audio data
+        const buf = event.data as ArrayBuffer;
+        if (buf.byteLength < 2) return;
+        const view = new DataView(buf);
+        const headerLen = view.getUint16(0);
+        const audioStart = 2 + headerLen;
+        if (audioStart < buf.byteLength) {
+          audioChunks.push(buf.slice(audioStart));
+        }
+      }
+    };
+
+    ws.onerror = (err: any) => {
+      console.warn('[EdgeTTS] WebSocket error:', err?.message || err);
+      done(false);
+    };
+
+    ws.onclose = () => {
+      done(audioChunks.length > 0);
+    };
+  });
 }
 
 // Get the welcome message endpoint
 function getWelcomeUrl(tenantId: string): string {
-  if (typeof window !== 'undefined' && window.location && !window.location.hostname.includes('localhost')) {
-    return `${window.location.origin}/api/welcome?tenantId=${tenantId}`;
-  }
-  return `${PROXY_BASE}/api/welcome/${tenantId}/status`;
+  return `${getProxyBase()}/api/welcome?tenantId=${tenantId}`;
 }
 
 // TTS provider configuration
 export type TTSProvider = 'edge' | 'elevenlabs';
 
-let currentTTSProvider: TTSProvider = 'elevenlabs'; // Default to ElevenLabs for testing
-let currentElevenLabsVoiceId: string = 'EXAVITQu4vr4xnSDxMaL'; // Default: Bella
+let currentTTSProvider: TTSProvider = 'elevenlabs'; // Default to ElevenLabs (Ate Jane — Filipino voice)
+let currentElevenLabsVoiceId: string = 'EXAVITQu4vr4xnSDxMaL'; // Default: Sarah (premade, free, multilingual v2 speaks Tagalog)
 
 export function setTTSProvider(provider: TTSProvider) {
   currentTTSProvider = provider;
@@ -58,66 +149,60 @@ export async function speak(text: string, voice: string = DEFAULT_VOICE): Promis
   }
   isSpeaking = true;
 
-  // Try ElevenLabs first if selected
+  const edgeVoice = voice || DEFAULT_VOICE;
+  console.log('[TTS] speak() called — provider:', currentTTSProvider, '| edgeVoice:', edgeVoice, '| elevenLabsVoice:', currentElevenLabsVoiceId);
+
+  // Try ElevenLabs if selected (requires paid plan)
   if (currentTTSProvider === 'elevenlabs') {
-    // Use Vercel API route on deployed web, localhost proxy for local dev
-    const ttsUrl = Platform.OS === 'web' ? getElevenLabsProxyUrl() : ELEVENLABS_TTS_PROXY;
+    const voiceId = currentElevenLabsVoiceId || 'EXAVITQu4vr4xnSDxMaL';
+    const directUrl = `${ELEVENLABS_DIRECT_URL}/${voiceId}`;
+    console.log('[TTS] Trying ElevenLabs direct:', directUrl);
     try {
-      const response = await fetch(ttsUrl, {
+      const response = await fetch(directUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'xi-api-key': ELEVENLABS_API_KEY,
+          'xi-api-key': ELEVENLABS_DEFAULT_KEY,
         },
         body: JSON.stringify({
           text,
-          voice_id: currentElevenLabsVoiceId,
           model_id: 'eleven_multilingual_v2',
           voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true },
         }),
       });
 
       if (response.ok) {
-        const audioBlob = await response.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        if (Platform.OS === 'web') {
-          await playAudioWeb(audioUrl);
-        } else {
-          await playAudioNative(audioUrl);
-        }
+        console.log('[TTS] ElevenLabs OK — got audio, playing...');
+        await playAudioFromResponse(response);
         isSpeaking = false;
         return;
       }
-    } catch {
-      // TTS proxy failed — fall through to Edge TTS / expo-speech
+      console.warn('[TTS] ElevenLabs API failed:', response.status);
+    } catch (err) {
+      console.warn('[TTS] ElevenLabs error:', err);
     }
   }
 
+  // Edge TTS — direct WebSocket to Microsoft (free, no proxy, neural Filipino voices)
   try {
-    // Edge TTS via proxy (natural voice)
-    const response = await fetch(TTS_PROXY, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voice }),
-    });
-
-    if (response.ok) {
-      const audioBlob = await response.blob();
-      const audioUrl = URL.createObjectURL(audioBlob);
-
-      if (Platform.OS === 'web') {
-        await playAudioWeb(audioUrl);
-      } else {
-        await playAudioNative(audioUrl);
-      }
+    console.log('[TTS] Trying Edge TTS direct WebSocket — voice:', edgeVoice);
+    const audioBlob = await edgeTTSDirect(text, edgeVoice);
+    if (audioBlob && audioBlob.size > 0) {
+      console.log('[TTS] Edge TTS OK — playing', audioBlob.size, 'bytes');
+      // Convert blob to Response for playAudioFromResponse
+      const audioBuffer = await new Response(audioBlob).arrayBuffer();
+      const fakeResp = new Response(audioBuffer, { headers: { 'Content-Type': 'audio/mpeg' } });
+      await playAudioFromResponse(fakeResp);
       isSpeaking = false;
       return;
     }
-  } catch {
-    // Edge TTS proxy not available — fall back to expo-speech
+    console.warn('[TTS] Edge TTS returned no audio');
+  } catch (err) {
+    console.warn('[TTS] Edge TTS error:', err);
   }
 
-  // Fallback: expo-speech (robotic but works without proxy)
+  // Last fallback: expo-speech (robotic but always works)
+  console.log('[TTS] Falling back to expo-speech');
   return new Promise((resolve) => {
     ExpoSpeech.speak(text, {
       language: 'fil-PH',
@@ -126,7 +211,6 @@ export async function speak(text: string, voice: string = DEFAULT_VOICE): Promis
       onDone: () => { isSpeaking = false; resolve(); },
       onError: () => {
         isSpeaking = false;
-        // Last resort: English
         ExpoSpeech.speak(text, {
           language: 'en-US',
           pitch: 1.0,
@@ -140,30 +224,66 @@ export async function speak(text: string, voice: string = DEFAULT_VOICE): Promis
   });
 }
 
-function playAudioWeb(url: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const audio = new window.Audio(url);
-    audio.onended = () => { isSpeaking = false; URL.revokeObjectURL(url); resolve(); };
-    audio.onerror = () => { isSpeaking = false; URL.revokeObjectURL(url); reject(new Error('Audio playback failed')); };
-    audio.play().catch(reject);
-  });
+// Convert ArrayBuffer to base64 (works in all JS environments)
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    const slice = bytes.subarray(i, i + chunk);
+    binary += String.fromCharCode.apply(null, Array.from(slice));
+  }
+  return typeof btoa === 'function'
+    ? btoa(binary)
+    : Buffer.from(binary, 'binary').toString('base64');
 }
 
-async function playAudioNative(uri: string): Promise<void> {
-  try {
-    const { sound } = await Audio.Sound.createAsync({ uri });
-    currentSound = sound;
-    sound.setOnPlaybackStatusUpdate((status) => {
-      if ('didJustFinish' in status && status.didJustFinish) {
-        isSpeaking = false;
-        sound.unloadAsync();
-        currentSound = null;
-      }
-    });
-    await sound.playAsync();
-  } catch {
-    isSpeaking = false;
+// Play audio from a fetch Response — converts to base64 data URI to avoid Blob/URL issues
+async function playAudioFromResponse(response: Response): Promise<void> {
+  const buffer = await response.arrayBuffer();
+  const base64 = arrayBufferToBase64(buffer);
+  const dataUri = `data:audio/mpeg;base64,${base64}`;
+  console.log('[TTS] Audio size:', buffer.byteLength, 'bytes, playing as data URI...');
+
+  // Try window.Audio (works in browsers / Expo Web)
+  if (typeof window !== 'undefined' && typeof window.Audio === 'function') {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const audio = new window.Audio(dataUri);
+        audio.onended = () => { isSpeaking = false; resolve(); };
+        audio.onerror = () => { isSpeaking = false; reject(new Error('Web audio playback failed')); };
+        audio.play().catch(reject);
+      });
+      console.log('[TTS] Played via window.Audio');
+      return;
+    } catch (err) {
+      console.warn('[TTS] window.Audio failed:', err);
+    }
   }
+
+  // Try expo-av (native Android/iOS)
+  try {
+    const { sound } = await Audio.Sound.createAsync({ uri: dataUri });
+    currentSound = sound;
+    await new Promise<void>((resolve) => {
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if ('didJustFinish' in status && status.didJustFinish) {
+          isSpeaking = false;
+          sound.unloadAsync();
+          currentSound = null;
+          resolve();
+        }
+      });
+      sound.playAsync();
+    });
+    console.log('[TTS] Played via expo-av');
+    return;
+  } catch (err) {
+    console.warn('[TTS] expo-av failed:', err);
+  }
+
+  isSpeaking = false;
+  throw new Error('No audio player available');
 }
 
 export async function stopSpeaking() {
@@ -194,20 +314,13 @@ export async function playWelcomeMessage(tenantId: string = 'default'): Promise<
     if (!status.exists) return false;
 
     // Fetch and play the prerecorded audio
-    const audioRes = await fetch(`${PROXY_BASE}/api/welcome/${tenantId}`);
+    const audioRes = await fetch(`${getProxyBase()}/api/welcome?tenantId=${tenantId}&audio=true`);
     if (!audioRes.ok) return false;
-
-    const audioBlob = await audioRes.blob();
-    const audioUrl = URL.createObjectURL(audioBlob);
 
     if (isSpeaking) await stopSpeaking();
     isSpeaking = true;
 
-    if (Platform.OS === 'web') {
-      await playAudioWeb(audioUrl);
-    } else {
-      await playAudioNative(audioUrl);
-    }
+    await playAudioFromResponse(audioRes);
     return true;
   } catch {
     isSpeaking = false;
@@ -217,7 +330,7 @@ export async function playWelcomeMessage(tenantId: string = 'default'): Promise<
 
 export async function uploadWelcomeMessage(tenantId: string, audioBlob: Blob): Promise<boolean> {
   try {
-    const res = await fetch(`${PROXY_BASE}/api/welcome/upload`, {
+    const res = await fetch(`${getProxyBase()}/api/welcome-upload`, {
       method: 'POST',
       headers: {
         'Content-Type': audioBlob.type || 'audio/webm',
@@ -233,7 +346,7 @@ export async function uploadWelcomeMessage(tenantId: string, audioBlob: Blob): P
 
 export async function deleteWelcomeMessage(tenantId: string): Promise<boolean> {
   try {
-    const res = await fetch(`${PROXY_BASE}/api/welcome/${tenantId}`, { method: 'DELETE' });
+    const res = await fetch(`${getProxyBase()}/api/welcome?tenantId=${tenantId}`, { method: 'DELETE' });
     return res.ok;
   } catch {
     return false;
@@ -477,7 +590,7 @@ export async function startListeningWeb(
       audioChunks = [];
 
       try {
-        const response = await fetch(STT_PROXY, {
+        const response = await fetch(`${getProxyBase()}/api/stt`, {
           method: 'POST',
           headers: { 'Content-Type': blob.type },
           body: blob,
@@ -530,7 +643,8 @@ export function startStreamingSTT(
       return;
     }
 
-    sttWebSocket = new WebSocket(STT_WS);
+    const wsBase = getProxyBase().replace(/^http/, 'ws');
+    sttWebSocket = new WebSocket(`${wsBase}/api/stt/stream`);
     sttWebSocket.binaryType = 'arraybuffer';
 
     sttWebSocket.onopen = () => {};

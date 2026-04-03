@@ -1,4 +1,4 @@
-import { ChatMessage, chatCompletion } from './NvidiaAIClient';
+import { ChatMessage, chatCompletion, chatCompletionStream } from './NvidiaAIClient';
 
 export type CallGoal = 'book' | 'order';
 
@@ -121,23 +121,23 @@ export class ConversationManager {
     this.transcript = [];
   }
 
-  async getGreeting(): Promise<string> {
+  async getGreeting(onToken?: (partial: string) => void): Promise<string> {
     this.messages.push({
       role: 'user',
       content: '[Call connected. Greet the caller.]',
     });
 
-    const response = await chatCompletion(this.apiKey, this.messages);
+    const response = await chatCompletionStream(this.apiKey, this.messages, onToken);
     this.messages.push({ role: 'assistant', content: response });
     this.transcript.push({ role: 'ai', text: response });
     return response;
   }
 
-  async respond(callerText: string): Promise<string> {
+  async respond(callerText: string, onToken?: (partial: string) => void): Promise<string> {
     this.messages.push({ role: 'user', content: callerText });
     this.transcript.push({ role: 'caller', text: callerText });
 
-    const response = await chatCompletion(this.apiKey, this.messages);
+    const response = await chatCompletionStream(this.apiKey, this.messages, onToken);
     this.messages.push({ role: 'assistant', content: response });
     this.transcript.push({ role: 'ai', text: response });
     return response;

@@ -3,6 +3,7 @@ import {
   View, Text, TextInput, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Modal, Platform,
 } from 'react-native';
 import { getAllTenants, createTenant, updateTenant, toggleTenantActive, deleteTenant, type Tenant } from '../services/AdminService';
+import { getApiBase } from '../services/ApiBase';
 import { supabaseAdmin } from '../services/SupabaseClient';
 
 // Alert that works on web too
@@ -101,17 +102,17 @@ export default function AdminTenantsScreen({ onBack }: Props) {
     // Sync keys to the proxy server for runtime rotation
     try {
       // Clear existing keys first
-      const listRes = await fetch('http://localhost:3456/api/elevenlabs/keys');
+      const listRes = await fetch(`${getApiBase()}/api/elevenlabs-keys`);
       if (listRes.ok) {
         const data = await listRes.json();
         // Remove all existing keys (reverse order to avoid index shift)
         for (let i = data.keys.length - 1; i >= 0; i--) {
-          await fetch(`http://localhost:3456/api/elevenlabs/keys/${i}`, { method: 'DELETE' });
+          await fetch(`${getApiBase()}/api/elevenlabs-keys/${i}`, { method: 'DELETE' });
         }
       }
       // Add new keys
       for (const k of keys) {
-        await fetch('http://localhost:3456/api/elevenlabs/keys', {
+        await fetch(`${getApiBase()}/api/elevenlabs-keys`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(k),

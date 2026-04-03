@@ -18,28 +18,11 @@ import AdminAppPreviewScreen from './src/screens/AdminAppPreviewScreen';
 import TenantDashboardScreen from './src/screens/TenantDashboardScreen';
 import TenantConfigScreen from './src/screens/TenantConfigScreen';
 import TenantMetricsScreen from './src/screens/TenantMetricsScreen';
+import { checkForUpdate, promptUpdate } from './src/services/UpdateService';
 
-// Global call state — shared with TenantDashboardScreen
-interface CallState {
-  isOnCall: boolean;
-  phoneNumber: string;
-  callId: string;
-  flowState: string;
-  listeners: Set<() => void>;
-  update: (patch: Partial<Pick<CallState, 'isOnCall' | 'phoneNumber' | 'callId' | 'flowState'>>) => void;
-}
-
-export const callState: CallState = {
-  isOnCall: false,
-  phoneNumber: '',
-  callId: '',
-  flowState: '',
-  listeners: new Set<() => void>(),
-  update(patch) {
-    Object.assign(callState, patch);
-    callState.listeners.forEach((fn: () => void) => fn());
-  },
-};
+// Import and re-export callState from its own module to avoid require cycles
+import { callState } from './src/services/CallState';
+export { callState };
 
 export default function App() {
   const [screen, setScreen] = useState('loading');
@@ -161,6 +144,11 @@ export default function App() {
           const p = await getCurrentProfile();
           setProfile(p);
           setScreen(p?.role === 'admin' ? 'admin-dashboard' : 'tenant-dashboard');
+
+          // Check for app updates after login
+          checkForUpdate().then((update) => {
+            if (update) promptUpdate(update);
+          });
         } else {
           setScreen('login');
         }

@@ -6,7 +6,7 @@ import { supabaseAdmin } from '../services/SupabaseClient';
 import { signOut, getCurrentProfile } from '../services/AuthService';
 import { callService } from '../services/CallService';
 import * as Storage from '../services/StorageService';
-import { callState } from '../../App';
+import { callState } from '../services/CallState';
 
 interface CallLogEntry {
   id: string;

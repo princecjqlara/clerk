@@ -9,7 +9,9 @@ import { setTTSProvider, setElevenLabsVoiceId, uploadWelcomeMessage, deleteWelco
 import { ConversationManager } from '../services/ConversationManager';
 import { AVAILABLE_MODELS, setModel, getModel } from '../services/NvidiaAIClient';
 
-const PROXY_BASE = 'http://localhost:3456';
+import { getApiBase } from '../services/ApiBase';
+
+const PROXY_BASE = getApiBase();
 
 interface Props {
   onBack: () => void;
@@ -46,7 +48,7 @@ export default function TenantConfigScreen({ onBack }: Props) {
   const [ttsProvider, setTtsProvider] = useState<TTSProvider>('elevenlabs');
   const [elevenLabsVoices, setElevenLabsVoices] = useState<any[]>([]);
   const [elevenLabsKeyCount, setElevenLabsKeyCount] = useState(0);
-  const [selectedElevenLabsVoice, setSelectedElevenLabsVoice] = useState('');
+  const [selectedElevenLabsVoice, setSelectedElevenLabsVoice] = useState('EXAVITQu4vr4xnSDxMaL');
   const [loadingELVoices, setLoadingELVoices] = useState(false);
 
   // Welcome message state
@@ -70,11 +72,16 @@ export default function TenantConfigScreen({ onBack }: Props) {
   const testScrollRef = useRef<ScrollView>(null);
   const autoListenRef = useRef(true); // ref to avoid stale closures
 
-  useEffect(() => { loadTenant(); loadVoices(); checkElevenLabsKeys(); checkWelcomeMessage(); }, []);
+  useEffect(() => {
+    // Apply ElevenLabs + Sarah as default on mount (in case saved config is stale)
+    setTTSProvider('elevenlabs');
+    setElevenLabsVoiceId('EXAVITQu4vr4xnSDxMaL');
+    loadTenant(); loadVoices(); checkElevenLabsKeys(); checkWelcomeMessage();
+  }, []);
 
   const loadVoices = async () => {
     try {
-      const res = await fetch('http://localhost:3456/api/tts/voices');
+      const res = await fetch(`${PROXY_BASE}/api/tts-voices`);
       if (res.ok) {
         const data = await res.json();
         setVoices(data.recommended || []);
@@ -94,7 +101,7 @@ export default function TenantConfigScreen({ onBack }: Props) {
   // Check how many ElevenLabs keys the admin has configured (read-only for tenants)
   const checkElevenLabsKeys = async () => {
     try {
-      const res = await fetch(`${PROXY_BASE}/api/elevenlabs/keys`);
+      const res = await fetch(`${PROXY_BASE}/api/elevenlabs-keys`);
       if (res.ok) {
         const data = await res.json();
         setElevenLabsKeyCount(data.keys?.length || 0);
@@ -104,7 +111,7 @@ export default function TenantConfigScreen({ onBack }: Props) {
 
   const checkWelcomeMessage = async () => {
     try {
-      const res = await fetch(`${PROXY_BASE}/api/welcome/default/status`);
+      const res = await fetch(`${PROXY_BASE}/api/welcome?tenantId=default`);
       if (res.ok) {
         const data = await res.json();
         setHasWelcomeMsg(data.exists);
@@ -182,7 +189,7 @@ export default function TenantConfigScreen({ onBack }: Props) {
   const handlePlayWelcome = async () => {
     setPlayingWelcome(true);
     try {
-      const res = await fetch(`${PROXY_BASE}/api/welcome/default`);
+      const res = await fetch(`${PROXY_BASE}/api/welcome?tenantId=default&audio=true`);
       if (res.ok) {
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -215,8 +222,8 @@ export default function TenantConfigScreen({ onBack }: Props) {
     try {
       // Use the current TTS provider to generate audio
       const endpoint = ttsProvider === 'elevenlabs'
-        ? `${PROXY_BASE}/api/elevenlabs/tts`
-        : `${PROXY_BASE}/api/tts`;
+        ? `${PROXY_BASE}/api/elevenlabs-tts`
+        : `${PROXY_BASE}/api/edge-tts`;
 
       const body = ttsProvider === 'elevenlabs'
         ? { text: welcomeText.trim(), voice_id: selectedElevenLabsVoice || undefined }
@@ -251,7 +258,7 @@ export default function TenantConfigScreen({ onBack }: Props) {
   const loadElevenLabsVoices = async () => {
     setLoadingELVoices(true);
     try {
-      const res = await fetch(`${PROXY_BASE}/api/elevenlabs/voices`);
+      const res = await fetch(`${PROXY_BASE}/api/elevenlabs-voices`);
       if (res.ok) {
         const data = await res.json();
         setElevenLabsVoices(data.voices || []);
@@ -268,7 +275,7 @@ export default function TenantConfigScreen({ onBack }: Props) {
   const previewElevenLabsVoice = async (voiceId: string) => {
     setPlayingVoice(voiceId);
     try {
-      const res = await fetch(`${PROXY_BASE}/api/elevenlabs/preview`, {
+      const res = await fetch(`${PROXY_BASE}/api/elevenlabs-preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ voice_id: voiceId }),
@@ -292,7 +299,7 @@ export default function TenantConfigScreen({ onBack }: Props) {
   const previewVoice = async (voiceId: string) => {
     setPlayingVoice(voiceId);
     try {
-      const res = await fetch('http://localhost:3456/api/tts/preview', {
+      const res = await fetch(`${PROXY_BASE}/api/edge-tts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ voice: voiceId }),
@@ -335,14 +342,16 @@ export default function TenantConfigScreen({ onBack }: Props) {
         setRules(config.rules || '');
         setKnowledge(config.knowledge || '');
         setFlowSteps(config.flow_steps?.length ? config.flow_steps : ['Greet the caller', 'Ask how you can help', '']);
-        // Restore TTS provider settings
-        const provider = config.tts_provider || 'edge';
-        setTtsProvider(provider);
-        setTTSProvider(provider);
-        if (config.elevenlabs_voice_id) {
-          setSelectedElevenLabsVoice(config.elevenlabs_voice_id);
-          setElevenLabsVoiceId(config.elevenlabs_voice_id);
-        }
+        // Restore TTS provider settings — force elevenlabs + valid premade voice
+        // Premade voices that work on free plan: Sarah, Bella, Jessica
+        const FREE_VOICES = ['EXAVITQu4vr4xnSDxMaL', 'hpp4J3VqNfWAUOO0d1Us', 'cgSgspJ2msm6clMCkdW9'];
+        const savedVoice = config.elevenlabs_voice_id;
+        const voiceId = (savedVoice && FREE_VOICES.includes(savedVoice)) ? savedVoice : 'EXAVITQu4vr4xnSDxMaL';
+        console.log('[Config] Loaded voice:', savedVoice, '→ using:', voiceId);
+        setTtsProvider('elevenlabs');
+        setTTSProvider('elevenlabs');
+        setSelectedElevenLabsVoice(voiceId);
+        setElevenLabsVoiceId(voiceId);
       } else {
         // No config anywhere — show empty form ready to fill
         setTenant({ id: 'local', name: 'Local Config' } as any);
@@ -387,14 +396,15 @@ export default function TenantConfigScreen({ onBack }: Props) {
     setFlowSteps(config.flow_steps?.length ? config.flow_steps : ['Greet the caller', 'Ask how you can help', '']);
     setSelectedVoice(config.voice || 'fil-PH-BlessicaNeural');
 
-    // ElevenLabs settings
-    const provider = config.tts_provider || 'edge';
-    setTtsProvider(provider);
-    setTTSProvider(provider);
-    if (config.elevenlabs_voice_id) {
-      setSelectedElevenLabsVoice(config.elevenlabs_voice_id);
-      setElevenLabsVoiceId(config.elevenlabs_voice_id);
-    }
+    // ElevenLabs settings — force elevenlabs + valid premade voice
+    const FREE_VOICES = ['EXAVITQu4vr4xnSDxMaL', 'hpp4J3VqNfWAUOO0d1Us', 'cgSgspJ2msm6clMCkdW9'];
+    const savedVoice = config.elevenlabs_voice_id;
+    const voiceId = (savedVoice && FREE_VOICES.includes(savedVoice)) ? savedVoice : 'EXAVITQu4vr4xnSDxMaL';
+    console.log('[Config] loadForm voice:', savedVoice, '→ using:', voiceId);
+    setTtsProvider('elevenlabs');
+    setTTSProvider('elevenlabs');
+    setSelectedElevenLabsVoice(voiceId);
+    setElevenLabsVoiceId(voiceId);
     if (config.ai_model) {
       setSelectedModel(config.ai_model);
       setModel(config.ai_model);
@@ -470,14 +480,25 @@ export default function TenantConfigScreen({ onBack }: Props) {
     setTestMessages(prev => [...prev, { role: 'caller', text }]);
     setTestLoading(true);
 
+    console.log('[AI Test] User said:', text);
+
     // Send raw text to AI — the AI prompt already handles imperfect STT
     // The AI understands intent even with transcription errors
     try {
-      const response = await convoRef.current.respond(text);
-      setTestMessages(prev => [...prev, { role: 'ai', text: response }]);
+      setTestMessages(prev => [...prev, { role: 'ai', text: '...' }]);
+      const t0 = Date.now();
+      const response = await convoRef.current.respond(text, (partial) => {
+        setTestMessages(prev => [...prev.slice(0, -1), { role: 'ai', text: partial }]);
+      });
+      console.log('[AI Test] AI responded in', Date.now() - t0, 'ms:', response);
+      setTestMessages(prev => [...prev.slice(0, -1), { role: 'ai', text: response }]);
       await stopSpeaking();
+      console.log('[AI Test] Speaking response with TTS...');
       await speak(response);
-    } catch {}
+      console.log('[AI Test] TTS done');
+    } catch (err: any) {
+      console.error('[AI Test] Error:', err.message);
+    }
     setTestLoading(false);
     testBusyRef.current = false;
     setTimeout(() => testScrollRef.current?.scrollToEnd({ animated: true }), 100);
@@ -609,6 +630,20 @@ export default function TenantConfigScreen({ onBack }: Props) {
                 {selectedModel === m.id && <Text style={styles.goalCheck}>{'\u2713'}</Text>}
               </TouchableOpacity>
             ))}
+
+            {/* Current Config Summary */}
+            <View style={{ marginTop: 20, padding: 12, backgroundColor: '#0d1117', borderRadius: 8, borderWidth: 1, borderColor: '#30363d' }}>
+              <Text style={{ color: '#8b949e', fontSize: 11, fontWeight: '700', marginBottom: 6 }}>CURRENT CONFIG</Text>
+              <Text style={{ color: '#c9d1d9', fontSize: 12 }}>
+                Voice: {ttsProvider === 'elevenlabs' ? `ElevenLabs (${selectedElevenLabsVoice || 'EXAVITQu4vr4xnSDxMaL'})` : `Edge TTS (${selectedVoice})`}
+              </Text>
+              <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 2 }}>
+                Model: {AVAILABLE_MODELS.find(m => m.id === selectedModel)?.name || selectedModel}
+              </Text>
+              <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 2 }}>
+                Goal: {callGoal}
+              </Text>
+            </View>
           </View>
         )}
 
@@ -1017,6 +1052,17 @@ export default function TenantConfigScreen({ onBack }: Props) {
               Simulate a call. Mic auto-listens — just speak naturally and the AI responds when you stop talking.
             </Text>
 
+            {/* Active config display */}
+            <View style={{ padding: 10, backgroundColor: '#0d1117', borderRadius: 8, borderWidth: 1, borderColor: '#30363d', marginBottom: 12 }}>
+              <Text style={{ color: '#58a6ff', fontSize: 11, fontWeight: '700', marginBottom: 4 }}>ACTIVE CONFIG</Text>
+              <Text style={{ color: '#c9d1d9', fontSize: 11 }}>
+                Voice: {ttsProvider === 'elevenlabs' ? `ElevenLabs (${selectedElevenLabsVoice || 'EXAVITQu4vr4xnSDxMaL - Sarah'})` : `Edge TTS (${selectedVoice})`}
+              </Text>
+              <Text style={{ color: '#c9d1d9', fontSize: 11 }}>
+                Model: {AVAILABLE_MODELS.find(m => m.id === selectedModel)?.name || selectedModel}
+              </Text>
+            </View>
+
             {!testStarted ? (
               <View style={{ alignItems: 'center', paddingVertical: 30 }}>
                 <TouchableOpacity
@@ -1029,6 +1075,20 @@ export default function TenantConfigScreen({ onBack }: Props) {
                     autoListenRef.current = true;
                     setAutoListen(true);
                     try {
+                      // Apply voice & model — force Sarah if saved voice doesn't work on free plan
+                      const FREE_VOICES = ['EXAVITQu4vr4xnSDxMaL', 'hpp4J3VqNfWAUOO0d1Us', 'cgSgspJ2msm6clMCkdW9'];
+                      setTTSProvider('elevenlabs');
+                      const voiceId = FREE_VOICES.includes(selectedElevenLabsVoice) ? selectedElevenLabsVoice : 'EXAVITQu4vr4xnSDxMaL';
+                      setElevenLabsVoiceId(voiceId);
+                      setModel(selectedModel);
+
+                      console.log('[AI Test] === Starting Test ===');
+                      console.log('[AI Test] TTS Provider:', ttsProvider);
+                      console.log('[AI Test] ElevenLabs Voice ID:', voiceId);
+                      console.log('[AI Test] AI Model:', selectedModel);
+                      console.log('[AI Test] Business:', tenant?.name || 'Test Business');
+                      console.log('[AI Test] Call Goal:', callGoal);
+
                       const apiKey = tenant?.nvidia_api_key || '';
                       const instructions = [
                         rules ? `RULES:\n${rules}` : '',
@@ -1052,8 +1112,11 @@ export default function TenantConfigScreen({ onBack }: Props) {
                         // Prime the conversation history without calling LLM
                         convoRef.current.getGreeting().catch(() => {});
                       } else {
-                        // No prerecorded — fall back to LLM greeting
-                        const greeting = await convoRef.current.getGreeting();
+                        // No prerecorded — fall back to LLM greeting (streamed)
+                        setTestMessages([{ role: 'ai', text: '...' }]);
+                        const greeting = await convoRef.current.getGreeting((partial) => {
+                          setTestMessages([{ role: 'ai', text: partial }]);
+                        });
                         setTestMessages([{ role: 'ai', text: greeting }]);
                         await speak(greeting);
                       }

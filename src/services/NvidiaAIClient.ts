@@ -40,16 +40,17 @@ interface NIMResponse {
   choices: { message: { content: string } }[];
 }
 
-export async function chatCompletion(
+// Streaming chat — calls onToken for each chunk, returns full text
+export async function chatCompletionStream(
   apiKey: string = DEFAULT_API_KEY,
   messages: ChatMessage[],
+  onToken?: (partial: string) => void,
 ): Promise<string> {
   const key = apiKey || DEFAULT_API_KEY;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 45000);
 
-  // Native: call NVIDIA directly. Web: use our serverless proxy to avoid CORS.
   const endpoint = Platform.OS === 'web' ? getWebProxyEndpoint() : NVIDIA_NIM_ENDPOINT;
 
   try {
@@ -64,6 +65,7 @@ export async function chatCompletion(
         messages,
         temperature: 0.7,
         max_tokens: 120,
+        stream: true,
       }),
       signal: controller.signal,
     });
@@ -73,8 +75,67 @@ export async function chatCompletion(
       throw new Error(`AI error ${response.status}: ${errorText}`);
     }
 
-    const data: NIMResponse = await response.json();
-    return data.choices[0]?.message?.content ?? 'I apologize, I could not process that.';
+    let full = '';
+
+    // Try ReadableStream first (modern browsers), fall back to text parsing
+    if (response.body && typeof response.body.getReader === 'function') {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data: ')) continue;
+          const payload = trimmed.slice(6);
+          if (payload === '[DONE]') break;
+          try {
+            const json = JSON.parse(payload);
+            const token = json.choices?.[0]?.delta?.content;
+            if (token) {
+              full += token;
+              onToken?.(full);
+            }
+          } catch {}
+        }
+      }
+    } else {
+      // Fallback: read entire response as text, parse SSE lines
+      const text = await response.text();
+      const lines = text.split('\n');
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data: ')) continue;
+        const payload = trimmed.slice(6);
+        if (payload === '[DONE]') continue;
+        try {
+          const json = JSON.parse(payload);
+          const token = json.choices?.[0]?.delta?.content;
+          if (token) {
+            full += token;
+            onToken?.(full);
+          }
+        } catch {}
+      }
+
+      // If SSE parsing got nothing, try parsing as regular JSON response
+      if (!full) {
+        try {
+          const json = JSON.parse(text);
+          full = json.choices?.[0]?.message?.content || '';
+        } catch {}
+      }
+    }
+
+    return full || 'I apologize, I could not process that.';
   } catch (err: any) {
     if (err.name === 'AbortError') {
       throw new Error('AI request timed out after 45 seconds. Check your network connection.');
@@ -83,4 +144,12 @@ export async function chatCompletion(
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+// Non-streaming fallback
+export async function chatCompletion(
+  apiKey: string = DEFAULT_API_KEY,
+  messages: ChatMessage[],
+): Promise<string> {
+  return chatCompletionStream(apiKey, messages);
 }
